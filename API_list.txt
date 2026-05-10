@@ -1,5 +1,5 @@
 ﻿================================================================================
-  SetupCraft — Documentation Index
+  NSBEdit — Documentation Index
 ================================================================================
 
   Location:
@@ -20,7 +20,44 @@
     _INTERNALS.txt  Architectural / flow reference — how a subsystem works
                     internally, bug history, and fix guidance.
 
-  ── API (reusable toolbox modules) ──────────────────────────────────────────
+  ── NSBEdit core modules ─────────────────────────────────────────────────────
+
+  File                                          Description
+  ──────────────────────────────────────────────────────────────────────────────
+  NSBEdit.cpp                                   Main application — single-file Win32 app.
+                                                WinMain, Ne_WndProc, File menu (New/Open/
+                                                Save/SaveAs/Print/Exit), 17-control RTF
+                                                toolbar (Bold/Italic/Underline/Strike/
+                                                Subscript/Superscript/FontFace/FontSize/
+                                                Color/Highlight/Align L/C/R/J/Bullet/
+                                                Numbered/Image), status bar, About dialog
+                                                (GDI+ logo, curver.txt version), License
+                                                dialog (GPLv2.md stream). RichEdit50W via
+                                                Msftedit.dll, fallback RichEdit20W.
+                                                Ne_LayoutToolbar — greedy one-by-one
+                                                reflow, minClientW stored in NeState.
+                                                WM_GETMINMAXINFO enforces min width via
+                                                AdjustWindowRectEx. i18n: Ls()/Ne_Filter()
+                                                /Ne_Unescape()/Ne_LoadLocale(). Tooltip
+                                                subclass: Ne_SetTip/Ne_TipSubclassProc.
+                                                Control ID range: 201–219.
+
+  dpi.h / dpi.cpp                               DPI scaling utility — g_dpiScale (float,
+                                                initialised from GetDpiForSystem()/96.0f),
+                                                S(px) inline scaler. Include dpi.h and
+                                                wrap every hardcoded pixel value in S().
+
+  tooltip.h / tooltip.cpp                       Multilingual tooltip system — see
+                                                API_INTERNALS\API\tooltip_API.txt for
+                                                full documentation.
+
+  locale\en_GB.txt                              Embedded locale (RCDATA 10). All user-
+                                                visible strings. Format: KEY = value,
+                                                # comments, \n CRLF \t tab \\ backslash.
+                                                Loaded by Ne_LoadLocale() at startup.
+                                                Never read from disk at runtime.
+
+  ── Reference material (API_INTERNALS — carried over from toolbox) ───────────
 
   File                                          Description
   ──────────────────────────────────────────────────────────────────────────────
