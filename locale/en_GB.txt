@@ -1,0 +1,67 @@
+# NSBEdit locale file — en_GB
+# Format:  KEY = value
+# Escape sequences in values:  \n = CR+LF (Win32 line ending),  \t = tab,  \\ = backslash
+# About-dialog strings that go into RichEdit use \n for line breaks.
+
+# ── Application ──────────────────────────────────────────────────────────────
+APP_NAME = NSBEdit
+UNTITLED = Untitled
+
+# ── Menus ─────────────────────────────────────────────────────────────────────
+MENU_FILE   = &File
+MENU_NEW    = &New\tCtrl+N
+MENU_OPEN   = &Open...\tCtrl+O
+MENU_SAVE   = &Save\tCtrl+S
+MENU_SAVEAS = Save &As...\tCtrl+Shift+S
+MENU_PRINT  = &Print...\tCtrl+P
+MENU_EXIT   = E&xit
+MENU_HELP   = &Help
+MENU_ABOUT  = &About NSBEdit
+
+# ── File-dialog filters (pairs separated by |, converted to \0 at runtime) ───
+FILTER_OPEN   = Supported files (*.rtf;*.txt;*.md)|*.rtf;*.txt;*.md|RTF files (*.rtf)|*.rtf|Text files (*.txt)|*.txt|Markdown files (*.md)|*.md|All files (*.*)|*.*
+FILTER_SAVEAS = RTF files (*.rtf)|*.rtf|Text files (*.txt)|*.txt|All files (*.*)|*.*
+FILTER_IMAGE  = Image files|*.png;*.jpg;*.jpeg|PNG files (*.png)|*.png|JPEG files (*.jpg;*.jpeg)|*.jpg;*.jpeg
+
+# ── File-dialog titles ────────────────────────────────────────────────────────
+DLG_OPEN   = Open
+DLG_SAVEAS = Save As
+DLG_IMAGE  = Insert Image
+
+# ── Message boxes ─────────────────────────────────────────────────────────────
+MSG_OPEN_ERR      = Could not open file.
+MSG_SAVE_ERR      = Could not save file.
+MSG_IMG_OPEN_ERR  = Could not open image file.
+MSG_IMG_FMT_ERR   = Unsupported format. Please use PNG or JPEG.
+MSG_SAVE_PROMPT   = Save changes to "%s"?
+
+# ── Toolbar tooltips ──────────────────────────────────────────────────────────
+TIP_BOLD        = Bold  (Ctrl+B)
+TIP_ITALIC      = Italic  (Ctrl+I)
+TIP_UNDERLINE   = Underline  (Ctrl+U)
+TIP_STRIKE      = Strikethrough
+TIP_SUBSCRIPT   = Subscript  (e.g. H₂O)
+TIP_SUPERSCRIPT = Superscript  (e.g. m²)
+TIP_FONTFACE    = Font face
+TIP_FONTSIZE    = Font size (pt)
+TIP_COLOR       = Text colour
+TIP_HIGHLIGHT   = Highlight colour
+TIP_ALIGN_L     = Align left
+TIP_ALIGN_C     = Align centre
+TIP_ALIGN_R     = Align right
+TIP_ALIGN_J     = Justify
+TIP_BULLET      = Bullet list
+TIP_NUMBERED    = Numbered list
+TIP_IMAGE       = Insert image  (PNG / JPEG)
+
+# ── About dialog ──────────────────────────────────────────────────────────────
+# Trailing \n produces CR+LF in the RichEdit control.
+ABOUT_TITLE       = About NSBEdit
+ABOUT_APP_NAME    = NSBEdit\n
+ABOUT_SUBTITLE    = RTF Notepad for Windows\n\n
+ABOUT_PUBLISHED   = Published: 
+ABOUT_VERSION     = Version: 
+ABOUT_DESC        = A lightweight, standalone RTF editor built on Win32.\nSupports bold, italic, underline, strikethrough, superscript, subscript,\nfont face/size/colour, alignment, bullet and numbered lists, and image insertion.\n\n
+ABOUT_LICENSE     = Licensed under the GNU General Public License v2.\n
+ABOUT_BTN_LICENSE = View License
+ABOUT_BTN_CLOSE   = Close

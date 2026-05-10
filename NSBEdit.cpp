@@ -15,6 +15,7 @@
 #include <vector>
 #include <algorithm>
 #include <sstream>
+#include <unordered_map>
 #include <stdio.h>
 #include "../dpi.h"
 #include "../tooltip.h"
@@ -28,6 +29,7 @@
 #define IDM_EXIT            105
 #define IDM_PRINT           106
 #define IDM_ABOUT           107
+#define IDR_LOCALE_EN_GB    10
 
 #define IDC_NE_EDIT         201
 #define IDC_NE_BOLD         202
@@ -67,6 +69,71 @@ static HMODULE s_neRtfDll = NULL;
 
 // ── Global main hwnd (for message-loop keyboard intercept) ─────────────────────
 static HWND s_hwndMain = NULL;
+
+// ── Locale / i18n ─────────────────────────────────────────────────────────────
+static std::unordered_map<std::wstring, std::wstring> g_str;
+
+static std::wstring Ne_Unescape(const std::wstring& s)
+{
+    std::wstring r; r.reserve(s.size());
+    for (size_t i = 0; i < s.size(); ++i) {
+        if (s[i] == L'\\' && i + 1 < s.size()) {
+            ++i;
+            switch (s[i]) {
+                case L'n': r += L'\r'; r += L'\n'; break;
+                case L't': r += L'\t'; break;
+                default:   r += s[i]; break;
+            }
+        } else r += s[i];
+    }
+    return r;
+}
+
+static void Ne_LoadLocale()
+{
+    // Loads the embedded locale resource (RCDATA id IDR_LOCALE_EN_GB).
+    // Add locale-selection logic here when more locales are added.
+    HINSTANCE hi = GetModuleHandleW(NULL);
+    HRSRC hRes = FindResourceW(hi, MAKEINTRESOURCEW(IDR_LOCALE_EN_GB), RT_RCDATA);
+    if (!hRes) return;
+    HGLOBAL hG = LoadResource(hi, hRes);
+    if (!hG) return;
+    const char* data = (const char*)LockResource(hG);
+    DWORD sz = SizeofResource(hi, hRes);
+    if (!data || !sz) return;
+    int wn = MultiByteToWideChar(CP_UTF8, 0, data, (int)sz, NULL, 0);
+    std::wstring text(wn, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, data, (int)sz, text.data(), wn);
+    std::wstringstream ss(text);
+    std::wstring line;
+    while (std::getline(ss, line)) {
+        if (!line.empty() && line.back() == L'\r') line.pop_back();
+        if (line.empty() || line[0] == L'#') continue;
+        size_t eq = line.find(L'=');
+        if (eq == std::wstring::npos) continue;
+        std::wstring key = line.substr(0, eq);
+        std::wstring val = line.substr(eq + 1);
+        while (!key.empty() && key.back() == L' ') key.pop_back();
+        if (!val.empty() && val.front() == L' ') val.erase(0, 1);
+        g_str[std::move(key)] = Ne_Unescape(val);
+    }
+}
+
+// Returns the localized string for key, or key itself as fallback.
+static const wchar_t* Ls(const wchar_t* key)
+{
+    auto it = g_str.find(key);
+    return (it != g_str.end()) ? it->second.c_str() : key;
+}
+
+// Builds a double-null-terminated filter string from a locale key using '|' as pair separator.
+static std::wstring Ne_Filter(const wchar_t* key)
+{
+    std::wstring s = Ls(key);
+    for (auto& c : s) if (c == L'|') c = L'\0';
+    s += L'\0'; // c_str() adds the second \0 → OPENFILENAME double-null terminator
+    return s;
+}
 
 // ── RTF stream helpers ─────────────────────────────────────────────────────────
 struct NeStreamBuf { const std::string* src; size_t pos; };
@@ -201,18 +268,17 @@ static void Ne_InsertImage(HWND hwnd, HWND hEdit)
     wchar_t path[MAX_PATH] = {};
     OPENFILENAMEW ofn = {}; ofn.lStructSize = sizeof(ofn);
     ofn.hwndOwner   = hwnd;
-    ofn.lpstrFilter = L"Image files\0*.png;*.jpg;*.jpeg\0"
-                      L"PNG files (*.png)\0*.png\0"
-                      L"JPEG files (*.jpg;*.jpeg)\0*.jpg;*.jpeg\0\0";
+    auto filtImg = Ne_Filter(L"FILTER_IMAGE");
+    ofn.lpstrFilter = filtImg.c_str();
     ofn.lpstrFile   = path;
     ofn.nMaxFile    = MAX_PATH;
     ofn.Flags       = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
-    ofn.lpstrTitle  = L"Insert Image";
+    ofn.lpstrTitle  = Ls(L"DLG_IMAGE");
     if (!GetOpenFileNameW(&ofn)) return;
 
     FILE* f = nullptr;
     if (_wfopen_s(&f, path, L"rb") != 0 || !f) {
-        MessageBoxW(hwnd, L"Could not open image file.", L"Insert Image", MB_OK | MB_ICONERROR);
+        MessageBoxW(hwnd, Ls(L"MSG_IMG_OPEN_ERR"), Ls(L"DLG_IMAGE"), MB_OK | MB_ICONERROR);
         return;
     }
     fseek(f, 0, SEEK_END); long fsz = ftell(f); fseek(f, 0, SEEK_SET);
@@ -222,7 +288,7 @@ static void Ne_InsertImage(HWND hwnd, HWND hEdit)
 
     NeImgInfo info = Ne_ClassifyImage(raw);
     if (info.fmt == NeImgFmt::Unknown || info.w <= 0 || info.h <= 0) {
-        MessageBoxW(hwnd, L"Unsupported format. Please use PNG or JPEG.", L"Insert Image", MB_OK | MB_ICONWARNING);
+        MessageBoxW(hwnd, Ls(L"MSG_IMG_FMT_ERR"), Ls(L"DLG_IMAGE"), MB_OK | MB_ICONWARNING);
         return;
     }
 
@@ -339,7 +405,8 @@ static void Ne_UpdateTitle(HWND hwnd)
     std::wstring title;
     if (st->modified) title += L"* ";
     if (st->currentPath.empty()) {
-        title += L"Untitled \u2014 NSBEdit";
+        title += Ls(L"UNTITLED");
+        title += L" \u2014 NSBEdit";
     } else {
         size_t pos = st->currentPath.find_last_of(L"\\/");
         title += (pos == std::wstring::npos ? st->currentPath : st->currentPath.substr(pos + 1));
@@ -354,7 +421,7 @@ static void Ne_UpdateStatusText(HWND hwnd)
     if (!hSb) return;
     NeState* st = (NeState*)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
     if (!st) return;
-    const wchar_t* txt = st->currentPath.empty() ? L"Untitled" : st->currentPath.c_str();
+    const wchar_t* txt = st->currentPath.empty() ? Ls(L"UNTITLED") : st->currentPath.c_str();
     SendMessageW(hSb, SB_SETTEXT, 0, (LPARAM)txt);
 }
 
@@ -400,7 +467,7 @@ static void Ne_Print(HWND hwnd)
     DOCINFOW di = {};
     di.cbSize   = sizeof(di);
     NeState* st = (NeState*)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
-    std::wstring docTitle = (st && !st->currentPath.empty()) ? st->currentPath : L"Untitled";
+    std::wstring docTitle = (st && !st->currentPath.empty()) ? st->currentPath : Ls(L"UNTITLED");
     di.lpszDocName = docTitle.c_str();
 
     if (StartDocW(hDC, &di) <= 0) { DeleteDC(hDC); return; }
@@ -460,20 +527,17 @@ static void Ne_Open(HWND hwnd)
     wchar_t path[MAX_PATH] = {};
     OPENFILENAMEW ofn = {}; ofn.lStructSize = sizeof(ofn);
     ofn.hwndOwner   = hwnd;
-    ofn.lpstrFilter = L"Supported files (*.rtf;*.txt;*.md)\0*.rtf;*.txt;*.md\0"
-                      L"RTF files (*.rtf)\0*.rtf\0"
-                      L"Text files (*.txt)\0*.txt\0"
-                      L"Markdown files (*.md)\0*.md\0"
-                      L"All files (*.*)\0*.*\0\0";
+    auto filtOpen = Ne_Filter(L"FILTER_OPEN");
+    ofn.lpstrFilter = filtOpen.c_str();
     ofn.lpstrFile   = path;
     ofn.nMaxFile    = MAX_PATH;
     ofn.Flags       = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
-    ofn.lpstrTitle  = L"Open";
+    ofn.lpstrTitle  = Ls(L"DLG_OPEN");
     if (!GetOpenFileNameW(&ofn)) return;
 
     FILE* f = nullptr;
     if (_wfopen_s(&f, path, L"rb") != 0 || !f) {
-        MessageBoxW(hwnd, L"Could not open file.", L"NSBEdit", MB_OK | MB_ICONERROR);
+        MessageBoxW(hwnd, Ls(L"MSG_OPEN_ERR"), Ls(L"APP_NAME"), MB_OK | MB_ICONERROR);
         return;
     }
     fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
@@ -511,7 +575,7 @@ static bool Ne_SaveToPath(HWND hwnd, const std::wstring& path)
     std::string bytes = Ne_StreamOut(hEdit, asRtf);
     FILE* f = nullptr;
     if (_wfopen_s(&f, path.c_str(), L"wb") != 0 || !f) {
-        MessageBoxW(hwnd, L"Could not save file.", L"NSBEdit", MB_OK | MB_ICONERROR);
+        MessageBoxW(hwnd, Ls(L"MSG_SAVE_ERR"), Ls(L"APP_NAME"), MB_OK | MB_ICONERROR);
         return false;
     }
     fwrite(bytes.c_str(), 1, bytes.size(), f);
@@ -528,14 +592,13 @@ static bool Ne_SaveAs(HWND hwnd)
 
     OPENFILENAMEW ofn = {}; ofn.lStructSize = sizeof(ofn);
     ofn.hwndOwner   = hwnd;
-    ofn.lpstrFilter = L"RTF files (*.rtf)\0*.rtf\0"
-                      L"Text files (*.txt)\0*.txt\0"
-                      L"All files (*.*)\0*.*\0\0";
+    auto filtSave = Ne_Filter(L"FILTER_SAVEAS");
+    ofn.lpstrFilter = filtSave.c_str();
     ofn.lpstrFile   = path;
     ofn.nMaxFile    = MAX_PATH;
     ofn.lpstrDefExt = L"rtf";
     ofn.Flags       = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
-    ofn.lpstrTitle  = L"Save As";
+    ofn.lpstrTitle  = Ls(L"DLG_SAVEAS");
     if (!GetSaveFileNameW(&ofn)) return false;
 
     if (!Ne_SaveToPath(hwnd, path)) return false;
@@ -559,10 +622,10 @@ static bool Ne_PromptSaveIfModified(HWND hwnd)
 {
     NeState* st = (NeState*)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
     if (!st || !st->modified) return true;
-    const wchar_t* name = st->currentPath.empty() ? L"Untitled" : st->currentPath.c_str();
+    const wchar_t* name = st->currentPath.empty() ? Ls(L"UNTITLED") : st->currentPath.c_str();
     wchar_t msg[MAX_PATH + 64];
-    swprintf_s(msg, L"Save changes to \"%s\"?", name);
-    int r = MessageBoxW(hwnd, msg, L"NSBEdit", MB_YESNOCANCEL | MB_ICONQUESTION);
+    swprintf_s(msg, MAX_PATH + 64, Ls(L"MSG_SAVE_PROMPT"), name);
+    int r = MessageBoxW(hwnd, msg, Ls(L"APP_NAME"), MB_YESNOCANCEL | MB_ICONQUESTION);
     if (r == IDCANCEL) return false;
     if (r == IDYES)    return Ne_Save(hwnd);
     return true; // IDNO — discard
@@ -911,7 +974,7 @@ static void ShowNsbAboutDialog(HWND parent)
     if (y < 30) y = 30;
 
     HWND dlg = CreateWindowExW(WS_EX_DLGMODALFRAME|WS_EX_WINDOWEDGE,
-        L"NsbAboutClass", L"About NSBEdit",
+        L"NsbAboutClass", Ls(L"ABOUT_TITLE"),
         WS_POPUP|WS_CAPTION|WS_SYSMENU|WS_VISIBLE,
         x, y, W, H, parent, NULL, hi, NULL);
     if (!dlg) { Gdiplus::GdiplusShutdown(gdipToken); return; }
@@ -939,8 +1002,8 @@ static void ShowNsbAboutDialog(HWND parent)
     for (int i = 0; i < logoLines; i++) AppendNsbRich(hEdit, L"\r\n", false, RGB(0,0,0), 0, false);
 
     // Content
-    AppendNsbRich(hEdit, L"NSBEdit\r\n",          true,  RGB(180,20,20),  16, true);
-    AppendNsbRich(hEdit, L"RTF Notepad for Windows\r\n\r\n", false, RGB(80,80,80), 10, true);
+    AppendNsbRich(hEdit, Ls(L"ABOUT_APP_NAME"), true,  RGB(180,20,20),  16, true);
+    AppendNsbRich(hEdit, Ls(L"ABOUT_SUBTITLE"), false, RGB(80,80,80),   10, true);
     AppendNsbRich(hEdit, L"\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\r\n", false, RGB(180,20,20), 0, true);
 
     // Load version from curver.txt next to exe
@@ -971,13 +1034,13 @@ static void ShowNsbAboutDialog(HWND parent)
     if (published.empty()) published = L"—";
     if (version.empty())   version   = L"—";
 
-    AppendNsbRich(hEdit, L"Published: ", true,  RGB(0,0,0), 0, true);
+    AppendNsbRich(hEdit, Ls(L"ABOUT_PUBLISHED"), true,  RGB(0,0,0), 0, true);
     AppendNsbRich(hEdit, (published + L"\r\n").c_str(), false, RGB(0,0,0), 0, true);
-    AppendNsbRich(hEdit, L"Version: ",   true,  RGB(0,0,0), 0, true);
+    AppendNsbRich(hEdit, Ls(L"ABOUT_VERSION"),   true,  RGB(0,0,0), 0, true);
     AppendNsbRich(hEdit, (version   + L"\r\n").c_str(), false, RGB(0,0,0), 0, true);
     AppendNsbRich(hEdit, L"\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\r\n\r\n", false, RGB(180,20,20), 0, true);
-    AppendNsbRich(hEdit, L"A lightweight, standalone RTF editor built on Win32.\r\nSupports bold, italic, underline, strikethrough, superscript, subscript,\r\nfont face/size/colour, alignment, bullet and numbered lists, and image insertion.\r\n\r\n", false, RGB(40,40,40), 0, false);
-    AppendNsbRich(hEdit, L"Licensed under the GNU General Public License v2.\r\n", true, RGB(0,70,140), 0, false);
+    AppendNsbRich(hEdit, Ls(L"ABOUT_DESC"),    false, RGB(40,40,40), 0, false);
+    AppendNsbRich(hEdit, Ls(L"ABOUT_LICENSE"), true,  RGB(0,70,140), 0, false);
 
     SendMessageW(hEdit, EM_SETSEL, 0, 0);
     SendMessageW(hEdit, EM_SCROLLCARET, 0, 0);
@@ -985,10 +1048,10 @@ static void ShowNsbAboutDialog(HWND parent)
     // Buttons: View License | Close
     int totalBW = S(110) + S(10) + S(80);
     int bx = (rcC.right - totalBW) / 2, by = rcC.bottom - PAD - BTN_H;
-    HWND hLic = CreateWindowExW(0, L"BUTTON", L"View License",
+    HWND hLic = CreateWindowExW(0, L"BUTTON", Ls(L"ABOUT_BTN_LICENSE"),
         WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON,
         bx, by, S(110), BTN_H, dlg, (HMENU)1001, hi, NULL);
-    HWND hClose = CreateWindowExW(0, L"BUTTON", L"Close",
+    HWND hClose = CreateWindowExW(0, L"BUTTON", Ls(L"ABOUT_BTN_CLOSE"),
         WS_CHILD|WS_VISIBLE|BS_DEFPUSHBUTTON,
         bx+S(110)+S(10), by, S(80), BTN_H, dlg, (HMENU)IDOK, hi, NULL);
     HFONT hf = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
@@ -1041,18 +1104,18 @@ static LRESULT CALLBACK Ne_WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
         // ── File menu ─────────────────────────────────────────────────────────
         HMENU hMenu  = CreateMenu();
         HMENU hFile  = CreatePopupMenu();
-        AppendMenuW(hFile, MF_STRING, IDM_NEW,    L"&New\tCtrl+N");
-        AppendMenuW(hFile, MF_STRING, IDM_OPEN,   L"&Open...\tCtrl+O");
-        AppendMenuW(hFile, MF_STRING, IDM_SAVE,   L"&Save\tCtrl+S");
-        AppendMenuW(hFile, MF_STRING, IDM_SAVEAS, L"Save &As...\tCtrl+Shift+S");
+        AppendMenuW(hFile, MF_STRING, IDM_NEW,    Ls(L"MENU_NEW"));
+        AppendMenuW(hFile, MF_STRING, IDM_OPEN,   Ls(L"MENU_OPEN"));
+        AppendMenuW(hFile, MF_STRING, IDM_SAVE,   Ls(L"MENU_SAVE"));
+        AppendMenuW(hFile, MF_STRING, IDM_SAVEAS, Ls(L"MENU_SAVEAS"));
         AppendMenuW(hFile, MF_SEPARATOR, 0, NULL);
-        AppendMenuW(hFile, MF_STRING, IDM_PRINT,  L"&Print...\tCtrl+P");
+        AppendMenuW(hFile, MF_STRING, IDM_PRINT,  Ls(L"MENU_PRINT"));
         AppendMenuW(hFile, MF_SEPARATOR, 0, NULL);
-        AppendMenuW(hFile, MF_STRING, IDM_EXIT,   L"E&xit");
-        AppendMenuW(hMenu, MF_POPUP, (UINT_PTR)hFile, L"&File");
+        AppendMenuW(hFile, MF_STRING, IDM_EXIT,   Ls(L"MENU_EXIT"));
+        AppendMenuW(hMenu, MF_POPUP, (UINT_PTR)hFile, Ls(L"MENU_FILE"));
         HMENU hHelp = CreatePopupMenu();
-        AppendMenuW(hHelp, MF_STRING, IDM_ABOUT, L"&About NSBEdit");
-        AppendMenuW(hMenu, MF_POPUP, (UINT_PTR)hHelp, L"&Help");
+        AppendMenuW(hHelp, MF_STRING, IDM_ABOUT, Ls(L"MENU_ABOUT"));
+        AppendMenuW(hMenu, MF_POPUP, (UINT_PTR)hHelp, Ls(L"MENU_HELP"));
         SetMenu(hwnd, hMenu);
 
         // ── Load RichEdit DLL ─────────────────────────────────────────────────
@@ -1173,7 +1236,7 @@ static LRESULT CALLBACK Ne_WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
         {
             int parts[1] = { -1 };
             SendMessageW(hSb, SB_SETPARTS, 1, (LPARAM)parts);
-            SendMessageW(hSb, SB_SETTEXT,  0, (LPARAM)L"Untitled");
+            SendMessageW(hSb, SB_SETTEXT,  0, (LPARAM)Ls(L"UNTITLED"));
             if (st->hIconSmall)
                 SendMessageW(hSb, SB_SETICON, 0, (LPARAM)st->hIconSmall);
         }
@@ -1240,23 +1303,23 @@ static LRESULT CALLBACK Ne_WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
         }
 
         // ── Tooltips (English only) ───────────────────────────────────────────
-        Ne_SetTip(hBold,                                    L"Bold  (Ctrl+B)");
-        Ne_SetTip(hItalic,                                  L"Italic  (Ctrl+I)");
-        Ne_SetTip(hUnder,                                   L"Underline  (Ctrl+U)");
-        Ne_SetTip(GetDlgItem(hwnd, IDC_NE_STRIKE),         L"Strikethrough");
-        Ne_SetTip(GetDlgItem(hwnd, IDC_NE_SUBSCRIPT),      L"Subscript  (e.g. H\u2082O)");
-        Ne_SetTip(GetDlgItem(hwnd, IDC_NE_SUPERSCRIPT),    L"Superscript  (e.g. m\u00B2)");
-        Ne_SetTip(hFace,                                    L"Font face");
-        Ne_SetTip(hSzCombo,                                 L"Font size (pt)");
-        Ne_SetTip(hColor,                                   L"Text colour");
-        Ne_SetTip(GetDlgItem(hwnd, IDC_NE_HIGHLIGHT),      L"Highlight colour");
-        Ne_SetTip(GetDlgItem(hwnd, IDC_NE_ALIGN_L),        L"Align left");
-        Ne_SetTip(GetDlgItem(hwnd, IDC_NE_ALIGN_C),        L"Align centre");
-        Ne_SetTip(GetDlgItem(hwnd, IDC_NE_ALIGN_R),        L"Align right");
-        Ne_SetTip(GetDlgItem(hwnd, IDC_NE_ALIGN_J),        L"Justify");
-        Ne_SetTip(GetDlgItem(hwnd, IDC_NE_BULLET),         L"Bullet list");
-        Ne_SetTip(GetDlgItem(hwnd, IDC_NE_NUMBERED),       L"Numbered list");
-        Ne_SetTip(hImgBtn,                                  L"Insert image  (PNG / JPEG)");
+        Ne_SetTip(hBold,                                    Ls(L"TIP_BOLD"));
+        Ne_SetTip(hItalic,                                  Ls(L"TIP_ITALIC"));
+        Ne_SetTip(hUnder,                                   Ls(L"TIP_UNDERLINE"));
+        Ne_SetTip(GetDlgItem(hwnd, IDC_NE_STRIKE),         Ls(L"TIP_STRIKE"));
+        Ne_SetTip(GetDlgItem(hwnd, IDC_NE_SUBSCRIPT),      Ls(L"TIP_SUBSCRIPT"));
+        Ne_SetTip(GetDlgItem(hwnd, IDC_NE_SUPERSCRIPT),    Ls(L"TIP_SUPERSCRIPT"));
+        Ne_SetTip(hFace,                                    Ls(L"TIP_FONTFACE"));
+        Ne_SetTip(hSzCombo,                                 Ls(L"TIP_FONTSIZE"));
+        Ne_SetTip(hColor,                                   Ls(L"TIP_COLOR"));
+        Ne_SetTip(GetDlgItem(hwnd, IDC_NE_HIGHLIGHT),      Ls(L"TIP_HIGHLIGHT"));
+        Ne_SetTip(GetDlgItem(hwnd, IDC_NE_ALIGN_L),        Ls(L"TIP_ALIGN_L"));
+        Ne_SetTip(GetDlgItem(hwnd, IDC_NE_ALIGN_C),        Ls(L"TIP_ALIGN_C"));
+        Ne_SetTip(GetDlgItem(hwnd, IDC_NE_ALIGN_R),        Ls(L"TIP_ALIGN_R"));
+        Ne_SetTip(GetDlgItem(hwnd, IDC_NE_ALIGN_J),        Ls(L"TIP_ALIGN_J"));
+        Ne_SetTip(GetDlgItem(hwnd, IDC_NE_BULLET),         Ls(L"TIP_BULLET"));
+        Ne_SetTip(GetDlgItem(hwnd, IDC_NE_NUMBERED),       Ls(L"TIP_NUMBERED"));
+        Ne_SetTip(hImgBtn,                                  Ls(L"TIP_IMAGE"));
 
         SetFocus(hEdit);
         Ne_SyncToolbar(hwnd, hEdit);
@@ -1499,6 +1562,8 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR lpCmdLine, int nCmdShow)
         ReleaseDC(NULL, hdc);
     }
 
+    Ne_LoadLocale();
+
     INITCOMMONCONTROLSEX icc = { sizeof(icc), ICC_WIN95_CLASSES | ICC_BAR_CLASSES };
     InitCommonControlsEx(&icc);
 
@@ -1518,7 +1583,8 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR lpCmdLine, int nCmdShow)
     int ww = S(960), wh = S(640);
     int wx = (sw - ww) / 2, wy = (sh - wh) / 2;
 
-    s_hwndMain = CreateWindowExW(0, L"NSBEditWnd", L"Untitled \u2014 NSBEdit",
+    std::wstring initTitle = Ls(L"UNTITLED") + std::wstring(L" \u2014 NSBEdit");
+    s_hwndMain = CreateWindowExW(0, L"NSBEditWnd", initTitle.c_str(),
         WS_OVERLAPPEDWINDOW,
         wx, wy, ww, wh, NULL, NULL, hInst, NULL);
 
