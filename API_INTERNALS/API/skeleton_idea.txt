@@ -2,7 +2,7 @@
   Project Skeleton — Idea & Checklist
 ================================================================================
 
-  Goal: when SetupCraft is published, extract a reusable Win32/C++ project
+  Goal: when NSBEdit is published, extract a reusable Win32/C++ project
   skeleton so future projects start with a solid, proven foundation rather
   than from scratch.
 
@@ -259,7 +259,7 @@
   ── Notes & decisions to make ────────────────────────────────────────────────
 
   - Decide on a skeleton repo name (e.g. "win32-cpp-skeleton" or "WinBase").
-  - Strip all SetupCraft-specific IDs, DB schema, and page logic — skeleton
+  - Strip all NSBEdit-specific IDs, DB schema, and page logic — skeleton
     should compile to a blank main window + toolbar stub + status bar only.
   - Keep mingw_dlls\README.md so the DLL bundling convention is documented.
   - Consider a fix_locales.ps1 stub for future locale sync automation.
@@ -287,7 +287,7 @@
     SetScrollInfo(nPos=lvHPos, FALSE) immediately before LVM_SCROLL so any
     internal ShowScrollBar(TRUE) within LVM_SCROLL re-seeds from the correct
     baseline.  Both left and right tilt-wheel work reliably.
-  - sqlite3 amalgamation version: pin to the version used in SetupCraft
+  - sqlite3 amalgamation version: pin to the version used in NSBEdit
     at publish time and note it here.
   - IsDialogMessageW gotcha: ONLY call IsDialogMessageW on windows that were
     actually created via DialogBox/CreateDialog.  On WS_POPUP windows built
@@ -418,7 +418,7 @@
     3. In WM_MOUSELEAVE: HideTooltip(); trackingFlag=false;
     4. In WM_NCDESTROY: restore the original proc.
     This is identical to the pattern used for shell icon tooltips (WarningIcon,
-    CompInfoIcon, RegenBtn) throughout SetupCraft.
+    CompInfoIcon, RegenBtn) throughout NSBEdit.
 
   - TTF_SUBCLASS teardown rule — CRITICAL:
     When a tooltip is created with TTF_IDISHWND | TTF_SUBCLASS, Win32 subclasses
@@ -431,7 +431,7 @@
     Rule: In any teardown / page-switch sequence, call DestroyWindow(hTooltip) or
     TTM_DELTOOL for every TTF_SUBCLASS tooltip BEFORE running the loop that calls
     DestroyWindow on the subclassed target controls.
-    In SetupCraft: SETT_TearDown (which destroys s_hPathTooltip) must be called
+    In NSBEdit: SETT_TearDown (which destroys s_hPathTooltip) must be called
     before the controlIds[] destroy loop in SwitchPage, not after it.
     (Bug found: crash on second Settings-page visit, v2026.05.07.09.)
 

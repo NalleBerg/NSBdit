@@ -27,6 +27,31 @@ MENU_HELP       = &Help
 MENU_SHORTCUTS  = &Keyboard Shortcuts...\tF1
 MENU_ABOUT      = &About NSBEdit
 
+# ── Convert menu ─────────────────────────────────────────────────────────────
+MENU_CONVERT        = Con&vert
+MENU_CONV_TO_PLAIN  = Strip formatting — save as plain text
+MENU_CONV_TO_RTF    = Add &formatting — make RTF
+MENU_ENCODING       = &Encoding
+MENU_ENC_UTF8       = UTF-8
+MENU_ENC_UTF16LE    = UTF-16 LE
+MENU_ENC_ANSI       = ANSI (system)
+MENU_ENC_WIN1252    = Windows-1252 (Western)
+MENU_ENC_ISO8859_1  = ISO 8859-1 (Latin-1)
+
+# ── Encoding labels shown in status bar ──────────────────────────────────────
+ENC_RICHTEXT    = Rich text
+ENC_UTF8        = UTF-8
+ENC_UTF16LE     = UTF-16 LE
+ENC_ANSI        = ANSI
+ENC_WIN1252     = Windows-1252
+ENC_ISO8859_1   = ISO 8859-1
+ENC_UNKNOWN     = Plain text
+
+# ── Convert messages ─────────────────────────────────────────────────────────
+MSG_CONV_LOSSY  = Stripping RTF formatting will discard all bold, italic, colours and other rich text effects.\n\nContinue and save as plain text?
+MSG_ENC_LOSSY   = Some characters may not be representable in the chosen encoding and will be replaced with "?" or similar.\n\nContinue?
+MSG_DEL_PLAIN_FILE = The document has been saved as an RTF file.\n\nDelete the original plain text file?
+
 # ── File-dialog filters (pairs separated by |, converted to \0 at runtime) ───
 FILTER_OPEN   = Supported files (*.rtf;*.txt;*.md)|*.rtf;*.txt;*.md|RTF files (*.rtf)|*.rtf|Text files (*.txt)|*.txt|Markdown files (*.md)|*.md|All files (*.*)|*.*
 FILTER_SAVEAS = RTF files (*.rtf)|*.rtf|Text files (*.txt)|*.txt|All files (*.*)|*.*
@@ -40,6 +65,7 @@ DLG_IMAGE  = Insert Image
 # ── Message boxes ─────────────────────────────────────────────────────────────
 MSG_OPEN_ERR      = Could not open file.
 MSG_SAVE_ERR      = Could not save file.
+MSG_HAS_FORMATTING = This document contains formatting (bold, colours, font sizes, etc.) that cannot be stored in a plain-text file.\n\nClick Yes to save as plain text and discard all formatting.\nClick No to save as RTF instead (the file will be renamed with a .rtf extension).\nClick Cancel to go back without saving.
 MSG_IMG_OPEN_ERR  = Could not open image file.
 MSG_IMG_FMT_ERR   = Unsupported format. Please use PNG or JPEG.
 MSG_SAVE_PROMPT   = Save changes to "%s"?
@@ -47,6 +73,7 @@ DLG_SAVE_CHANGES  = Save Changes
 BTN_SAVE          = Save
 BTN_DONT_SAVE     = Don't Save
 BTN_CANCEL        = Cancel
+BTN_OK            = OK
 
 DLG_FILE_CHANGED        = File Changed on Disk
 MSG_FILE_CHANGED_PROMPT = "%s" was changed by another program while NSBEdit did not have focus.\n\nReload from disk?
@@ -80,11 +107,87 @@ TIP_ALIGN_J     = Justify
 TIP_BULLET      = Bullet list
 TIP_NUMBERED    = Numbered list
 TIP_IMAGE       = Insert image  (PNG / JPEG)
+TIP_INDENT_IN   = Increase indent
+TIP_INDENT_OUT  = Decrease indent
+TIP_LINESPACE   = Line spacing...
+TIP_FIND        = Find / Replace  (Ctrl+F)
+TIP_LINK        = Insert hyperlink
+TIP_TABLE       = Table properties...
+TIP_TABLE_DROP  = Insert table (choose size)
+TIP_HLINE       = Insert horizontal rule
+TIP_CLEARFMT    = Clear all formatting
+TIP_PRINT_BTN   = Print...  (Ctrl+P)
+TIP_ZOOM        = Zoom
+TIP_WORDWRAP    = Toggle word wrap
+TIP_CASE        = Toggle case  (UPPER / lower / Title)
+TIP_PARSPACE    = Paragraph spacing...
 
 # ── Export PDF ───────────────────────────────────────────────────────────────
 FILTER_PDF       = PDF files (*.pdf)|*.pdf
 DLG_EXPORT_PDF   = Export as PDF
 MSG_PDF_ERR      = Could not export PDF. Make sure "Microsoft Print to PDF" is installed (Windows 10+).
+
+# ── Find / Replace dialog ─────────────────────────────────────────────────────
+DLG_FIND            = Find / Replace
+DLG_FIND_WHAT       = Find:
+DLG_REPL_WITH       = Replace with:
+BTN_FIND_NEXT       = Find Next
+BTN_REPLACE         = Replace
+BTN_REPLACE_ALL     = Replace All
+CHK_MATCHCASE       = Match case
+CHK_WHOLEWORD       = Whole word
+MSG_FIND_NOT_FOUND  = Text not found.
+
+# ── Insert Link dialog ────────────────────────────────────────────────────────
+DLG_LINK        = Insert Hyperlink
+DLG_LINK_URL    = URL:
+DLG_LINK_TEXT   = Display text:
+LINK_TIP_CTRL   = [Ctrl]+Click to open in browser
+MSG_LINK_BAD_URL = Please enter a valid URL.
+
+A URL must begin with a recognised scheme such as:
+https://  http://  ftp://  mailto:  file://
+
+# ── Insert Table dialog ───────────────────────────────────────────────────────
+DLG_TABLE       = Insert Table
+DLG_TABLE_ROWS  = Rows:
+DLG_TABLE_COLS  = Columns:
+TABLE_PICKER_FMT  = %d × %d
+TABLE_PICKER_HINT = Select table size
+
+# ── Table Properties dialog ───────────────────────────────────────────────────
+DLG_TABLE_PROPS     = Table Properties
+DLG_TABLE_INSERT    = Insert Table
+TBLP_ROWS           = Rows:
+TBLP_COLS           = Columns:
+TBLP_CELLW          = Column width:
+TBLP_BORDERW        = Border width:
+TBLP_UNIT_HP        = half-pt
+TBLP_PAD_TOP        = Cell padding top:
+TBLP_PAD_BOTTOM     = Cell padding bottom:
+TBLP_PAD_LEFT       = Cell padding left:
+TBLP_PAD_RIGHT      = Cell padding right:
+TBLP_ROWH           = Row height (0=auto):
+TBLP_ROWH_UNIT      = pt
+TBLP_ALIGN          = Table alignment
+TBLP_ALIGN_L        = Left
+TBLP_ALIGN_C        = Centre
+TBLP_ALIGN_R        = Right
+BTN_APPLY           = Apply
+CTX_TABLE_PROPS     = Table properties...
+TBLP_MODE_ALTER     = Alter current table
+TBLP_MODE_NESTED    = Table in current cell
+
+# ── Line Spacing dialog ───────────────────────────────────────────────────────
+DLG_LINESPACE    = Line Spacing
+RDO_LINESPACE_S  = Single
+RDO_LINESPACE_15 = 1.5 lines
+RDO_LINESPACE_D  = Double
+
+# ── Paragraph Spacing dialog ──────────────────────────────────────────────────
+DLG_PARSPACE     = Paragraph Spacing
+DLG_PARSPACE_BEF = Space before (pt):
+DLG_PARSPACE_AFT = Space after (pt):
 
 # ── Keyboard Shortcuts dialog ─────────────────────────────────────────────────
 SHORTCUTS_TITLE  = Keyboard Shortcuts

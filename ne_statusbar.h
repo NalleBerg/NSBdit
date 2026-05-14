@@ -22,3 +22,6 @@ int NeStatusBar_GetHeight(HWND hBar);
 void NeStatusBar_SetLabels(HWND hBar,
     const wchar_t* wordsLabel, const wchar_t* charsLabel,
     const wchar_t* savedLabel, const wchar_t* unsavedLabel);
+
+// Set the centre info string (encoding / file type). Pass NULL to clear.
+void NeStatusBar_SetInfo(HWND hBar, const wchar_t* info);

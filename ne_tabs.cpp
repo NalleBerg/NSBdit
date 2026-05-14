@@ -7,7 +7,7 @@
 #include <stdio.h>
 
 #include "dpi.h"
-#include "tooltip.h"
+#include "tooltip/tooltip.h"
 
 struct NeTabsState {
     HWND hwndParent = NULL;
@@ -243,7 +243,7 @@ static LRESULT CALLBACK NeTabs_TabProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
 static bool NeTabs_CreateEdit(NeTabDoc& d)
 {
     d.hEdit = CreateWindowExW(WS_EX_CLIENTEDGE, g_tabs.richEditClass.c_str(), L"",
-        WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_WANTRETURN | ES_AUTOVSCROLL,
+        WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_HSCROLL | ES_MULTILINE | ES_WANTRETURN | ES_AUTOVSCROLL,
         g_tabs.editX, g_tabs.editY, std::max(1, g_tabs.editW), std::max(1, g_tabs.editH),
         g_tabs.hwndParent, (HMENU)(UINT_PTR)g_tabs.editCtrlId, GetModuleHandleW(NULL), NULL);
     return d.hEdit != NULL;

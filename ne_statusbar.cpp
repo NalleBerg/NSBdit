@@ -13,9 +13,10 @@ struct NeStatusBarState {
     std::wstring charsLabel   = L"Chars";
     std::wstring savedLabel   = L"Saved";
     std::wstring unsavedLabel = L"Unsaved";
+    std::wstring infoLabel;   // centre: encoding / file type
     HFONT hFont      = NULL;
-    HICON hIconSaved   = NULL;   // shell32 index 294
-    HICON hIconUnsaved = NULL;   // shell32 index 131
+    HICON hIconSaved   = NULL;
+    HICON hIconUnsaved = NULL;
 };
 
 static HICON NeSB_LoadShell32Icon(int index)
@@ -87,10 +88,18 @@ static LRESULT CALLBACK NeStatusBar_WndProc(HWND hwnd, UINT msg, WPARAM wParam, 
         swprintf_s(buf, L"%s: %d    %s: %d",
             st->wordsLabel.c_str(), st->words,
             st->charsLabel.c_str(), st->chars);
-        RECT leftRc = { rc.left + S(10), rc.top + 1, (rc.left + rc.right) / 2, rc.bottom };
+        RECT leftRc = { rc.left + S(10), rc.top + 1, rc.right / 3, rc.bottom };
         SetTextColor(hdc, RGB(60, 60, 60));
         DrawTextW(hdc, buf, -1, &leftRc,
                   DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+
+        // Centre: encoding / file-type info
+        if (!st->infoLabel.empty()) {
+            RECT centreRc = { rc.right / 3, rc.top + 1, rc.right * 2 / 3, rc.bottom };
+            SetTextColor(hdc, RGB(70, 80, 150));
+            DrawTextW(hdc, st->infoLabel.c_str(), -1, &centreRc,
+                      DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        }
 
         // Right side: icon + Saved / Unsaved
         const std::wstring& stateText = st->modified ? st->unsavedLabel : st->savedLabel;
@@ -185,5 +194,14 @@ void NeStatusBar_SetLabels(HWND hBar,
     if (charsLabel)   st->charsLabel   = charsLabel;
     if (savedLabel)   st->savedLabel   = savedLabel;
     if (unsavedLabel) st->unsavedLabel = unsavedLabel;
+    InvalidateRect(hBar, NULL, FALSE);
+}
+
+void NeStatusBar_SetInfo(HWND hBar, const wchar_t* info)
+{
+    if (!hBar) return;
+    NeStatusBarState* st = (NeStatusBarState*)GetWindowLongPtrW(hBar, GWLP_USERDATA);
+    if (!st) return;
+    st->infoLabel = info ? info : L"";
     InvalidateRect(hBar, NULL, FALSE);
 }

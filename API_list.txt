@@ -55,8 +55,30 @@
                                                 white-background question dialog with
                                                 owner-draw icon buttons (Save/Don't
                                                 Save/Cancel and Reload/Keep flows),
-                                                locale-driven labels, and dynamic
-                                                text/button sizing.
+                                                locale-driven labels, dynamic
+                                                text/button sizing, optional hMsgIcon
+                                                (renders 32×32 icon left of message
+                                                text; dialog font is 12pt Segoe UI
+                                                via Ne_CreateDialogFont, freed on
+                                                WM_NCDESTROY).
+                                                Ne_ShowLinkDialog — Insert Hyperlink
+                                                modal: URL + display-text fields, Tab
+                                                navigation, Save (blue) / Cancel (red)
+                                                owner-draw buttons. Validates URL with
+                                                std::wregex (scheme://host.TLD, mailto,
+                                                file, www.). Bad URL shows warning
+                                                dialog (IDI_WARNING + shell32-294 OK).
+                                                Inserts RTF \field HYPERLINK at caret.
+                                                Ne_ExtractLinkUrlAt — streams RTF
+                                                around charIdx via SFF_SELECTION,
+                                                parses HYPERLINK "url" from \fldinst.
+                                                Ne_EditCaretProc — RichEdit subclass:
+                                                WM_MOUSEMOVE IDC_HAND detection shows
+                                                two-line tooltip (URL + Ctrl+Click
+                                                hint); WM_LBUTTONDOWN+Ctrl opens URL
+                                                with ShellExecuteW.
+                                                ENM_LINK on all EM_SETEVENTMASK calls;
+                                                EN_LINK fallback handler in WM_NOTIFY.
                                                 External file-change detection on
                                                 editor focus: compares current file's
                                                 last-write time + size against the
@@ -101,7 +123,7 @@
                                                 S(px) inline scaler. Include dpi.h and
                                                 wrap every hardcoded pixel value in S().
 
-  tooltip.h / tooltip.cpp                       Multilingual tooltip system — see
+  tooltip/tooltip.h / tooltip/tooltip.cpp      Multilingual tooltip system — see
                                                 API_INTERNALS\API\tooltip_API.txt for
                                                 full documentation.
 

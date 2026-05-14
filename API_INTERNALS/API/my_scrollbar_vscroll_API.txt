@@ -1,7 +1,7 @@
 ================================================================================
   my_scrollbar_vscroll_API.txt
   Custom Win32 vertical scrollbar — public API reference
-  my_scrollbar_vscroll.h / my_scrollbar_vscroll.cpp
+  scroll/my_scrollbar_vscroll.h / scroll/my_scrollbar_vscroll.cpp
 ================================================================================
 
 
@@ -27,7 +27,7 @@
     so the last line is always scrollable fully above the H bar, with a
     breathing-room margin (MSB_VERT_MARGIN, 6 logical px) below it.
   • DPI-aware: all pixel values go through S() internally; works at any DPI.
-  • No SetupCraft dependencies — only <windows.h>.
+  • No NSBEdit dependencies — only <windows.h>.
 
   Status (2026-04-19)
   ────────────────────

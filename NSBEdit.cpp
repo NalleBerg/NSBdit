@@ -16,12 +16,16 @@
 #include <vector>
 #include <algorithm>
 #include <sstream>
+#include <map>
 #include <unordered_map>
+#include <regex>
 #include <stdio.h>
 #include "dpi.h"
-#include "tooltip.h"
+#include "tooltip/tooltip.h"
 #include "ne_tabs.h"
 #include "ne_statusbar.h"
+#include "scroll/my_scrollbar_vscroll.h"
+#include "scroll/my_scrollbar_hscroll.h"
 
 // ── Control and menu IDs ───────────────────────────────────────────────────────
 #define IDI_APPICON         1
@@ -44,6 +48,25 @@
 #define IDM_REPLACE         117
 #define IDR_LOCALE_EN_GB    10
 
+// Convert menu
+#define IDM_CONV_TO_PLAIN   120
+#define IDM_ENC_UTF8        121
+#define IDM_ENC_UTF16LE     122
+#define IDM_ENC_ANSI        123
+#define IDM_ENC_WIN1252     124
+#define IDM_ENC_ISO8859_1   125
+#define IDM_CONV_TO_RTF     126
+
+enum class NeEncoding {
+    Unknown  = 0,
+    RichText,   // .rtf — not a text encoding, shown as "Rich text"
+    UTF8,
+    UTF16LE,
+    ANSI,       // system default codepage
+    Win1252,
+    ISO8859_1,
+};
+
 #define IDC_NE_EDIT         201
 #define IDC_NE_BOLD         202
 #define IDC_NE_ITALIC       203
@@ -63,10 +86,91 @@
 #define IDC_NE_NUMBERED     217
 #define IDC_NE_IMAGE        218
 #define IDC_NE_STATUSBAR    219
+#define IDC_NE_INDENT_IN    220
+#define IDC_NE_INDENT_OUT   221
+#define IDC_NE_LINESPACE    222
+#define IDC_NE_FIND         223
+#define IDC_NE_LINK         224
+#define IDC_NE_TABLE        225
+#define IDC_NE_TABLE_DROP   235   // ▼ split-arrow beside TABLE button
+#define IDC_NE_HLINE        226
+#define IDM_TABLE_PROPS     127   // Table properties (menu/button)
+#define IDM_CTX_TABLE_PROPS 128   // Context-menu "Table properties"
+#define IDM_CTX_HRULE_PROPS 129   // Context-menu "Horizontal Rule Properties"
+#define IDC_NE_CLEARFMT     227
+#define IDC_NE_PRINT_BTN    228
+#define IDC_NE_ZOOM         229
 #define IDC_NE_DLG_TEXT     230
 #define IDC_NE_TABCTRL      231
+#define IDC_NE_WORDWRAP     232
+#define IDC_NE_CASE         233
+#define IDC_NE_PARSPACE     234
+// ── Dialog-internal control IDs ───────────────────────────────────────────────
+#define IDC_NE_DLG_FIND_WHAT    240
+#define IDC_NE_DLG_FIND_NEXT    241
+#define IDC_NE_DLG_REPL_WITH    242
+#define IDC_NE_DLG_REPLACE      243
+#define IDC_NE_DLG_REPLACE_ALL  244
+#define IDC_NE_DLG_LINK_URL     246
+#define IDC_NE_DLG_LINK_TEXT    247
+#define IDC_NE_DLG_TABLE_ROWS   248
+#define IDC_NE_DLG_TABLE_COLS   249
+#define IDC_NE_DLG_MATCHCASE    250
+#define IDC_NE_DLG_WHOLEWORD    251
+#define IDC_NE_DLG_PAR_BEF      252
+#define IDC_NE_DLG_PAR_AFT      253
 
 // ── Internal state ─────────────────────────────────────────────────────────────
+// ── Per-tab custom scrollbar handles (keyed by hEdit HWND) ──────────────────
+static std::map<HWND, HMSB> s_sbV, s_sbH;
+
+static void Ne_AttachScrollbars(HWND hEdit)
+{
+    if (!hEdit) return;
+    if (s_sbV.count(hEdit)) return; // already attached
+    s_sbV[hEdit] = msb_attach(hEdit, MSB_VERTICAL);
+    s_sbH[hEdit] = msb_attach(hEdit, MSB_HORIZONTAL);
+}
+
+static void Ne_DetachScrollbars(HWND hEdit)
+{
+    if (!hEdit) return;
+    auto iv = s_sbV.find(hEdit);
+    if (iv != s_sbV.end()) { msb_detach(iv->second); s_sbV.erase(iv); }
+    auto ih = s_sbH.find(hEdit);
+    if (ih != s_sbH.end()) { msb_detach(ih->second); s_sbH.erase(ih); }
+}
+
+static void Ne_DetachAllScrollbars()
+{
+    for (auto& kv : s_sbV) msb_detach(kv.second);
+    for (auto& kv : s_sbH) msb_detach(kv.second);
+    s_sbV.clear();
+    s_sbH.clear();
+}
+
+// Show or hide each custom scrollbar bar window to match its edit's visibility,
+// and reposition bars for visible edits. Call after any tab switch or resize.
+static void Ne_SyncScrollbarVisibility(HWND hwnd)
+{
+    int n = NeTabs_GetCount(hwnd);
+    for (int i = 0; i < n; ++i) {
+        NeTabDoc* doc = NeTabs_GetDocByIndex(hwnd, i);
+        if (!doc || !doc->hEdit) continue;
+        bool vis = IsWindowVisible(doc->hEdit) != FALSE;
+        int sw = vis ? SW_SHOWNOACTIVATE : SW_HIDE;
+        auto syncBar = [&](std::map<HWND,HMSB>& m) {
+            auto it = m.find(doc->hEdit);
+            if (it == m.end() || !it->second) return;
+            HWND hBar = msb_get_bar_hwnd(it->second);
+            if (hBar) ShowWindow(hBar, sw);
+            if (vis) msb_reposition(it->second);
+        };
+        syncBar(s_sbV);
+        syncBar(s_sbH);
+    }
+}
+
 struct NeState {
     bool  updatingToolbar = false;
     int   tabY            = 0;
@@ -261,6 +365,149 @@ static void Ne_ToggleNumbered(HWND hEdit)
     SendMessageW(hEdit, EM_SETPARAFORMAT, 0, (LPARAM)&pf);
 }
 
+// ── Indent / Outdent ──────────────────────────────────────────────────────────
+// ── Per-button text colours ───────────────────────────────────────────────────
+static COLORREF Ne_BtnTextColor(int id)
+{
+    switch (id) {
+    // Character formatting
+    case IDC_NE_BOLD:        return RGB(15,  30,  140); // deep navy
+    case IDC_NE_ITALIC:      return RGB(30,  85,  200); // royal blue
+    case IDC_NE_UNDERLINE:   return RGB(0,   110, 215); // cobalt blue
+    case IDC_NE_STRIKE:      return RGB(180, 25,  25);  // crimson
+    case IDC_NE_SUBSCRIPT:   return RGB(0,   135, 115); // teal
+    case IDC_NE_SUPERSCRIPT: return RGB(0,   135, 115); // teal
+    // Alignment
+    case IDC_NE_ALIGN_L:
+    case IDC_NE_ALIGN_C:
+    case IDC_NE_ALIGN_R:
+    case IDC_NE_ALIGN_J:     return RGB(55,  75,  170); // slate blue
+    // Lists
+    case IDC_NE_BULLET:
+    case IDC_NE_NUMBERED:    return RGB(20,  130, 30);  // forest green
+    // Colour pickers
+    case IDC_NE_COLOR:       return RGB(200, 15,  15);  // red — classic "A" in Word
+    // Indent
+    case IDC_NE_INDENT_IN:
+    case IDC_NE_INDENT_OUT:  return RGB(50,  100, 175); // steel blue
+    // Spacing
+    case IDC_NE_LINESPACE:   return RGB(125, 0,   185); // violet
+    case IDC_NE_PARSPACE:    return RGB(125, 0,   185); // violet
+    // Tools
+    case IDC_NE_FIND:        return RGB(195, 95,  0);   // amber
+    case IDC_NE_LINK:        return RGB(0,   80,  215); // hyperlink blue
+    case IDC_NE_TABLE:       return RGB(0,   120, 105); // dark teal
+    case IDC_NE_HLINE:       return RGB(100, 100, 110); // slate grey
+    case IDC_NE_CLEARFMT:    return RGB(175, 0,   0);   // deep red
+    case IDC_NE_PRINT_BTN:   return RGB(0,   120, 0);   // forest green
+    case IDC_NE_IMAGE:       return RGB(55,  95,  185); // blue
+    // View / misc
+    case IDC_NE_WORDWRAP:    return RGB(0,   140, 105); // teal green
+    case IDC_NE_CASE:        return RGB(105, 0,   165); // purple
+    default:                 return RGB(30,  30,  30);  // near-black
+    }
+}
+
+static void Ne_Indent(HWND hEdit, bool increase)
+{
+    PARAFORMAT2 pf = {}; pf.cbSize = sizeof(pf);
+    pf.dwMask = PFM_OFFSET | PFM_STARTINDENT;
+    SendMessageW(hEdit, EM_GETPARAFORMAT, 0, (LPARAM)&pf);
+    LONG step = 360; // 0.25 inch in twips
+    LONG newOff = pf.dxOffset + (increase ? step : -step);
+    LONG newSt  = pf.dxStartIndent + (increase ? step : -step);
+    if (newOff < 0) newOff = 0;
+    if (newSt  < 0) newSt  = 0;
+    pf.dwMask        = PFM_OFFSET | PFM_STARTINDENT;
+    pf.dxOffset      = newOff;
+    pf.dxStartIndent = newSt;
+    SendMessageW(hEdit, EM_SETPARAFORMAT, 0, (LPARAM)&pf);
+}
+
+// ── Clear all character formatting on selection ───────────────────────────────
+static void Ne_ClearFormatting(HWND hEdit)
+{
+    CHARFORMAT2W cf = {}; cf.cbSize = sizeof(cf);
+    cf.dwMask    = CFM_BOLD | CFM_ITALIC | CFM_UNDERLINE | CFM_STRIKEOUT |
+                   CFM_SUBSCRIPT | CFM_SUPERSCRIPT | CFM_COLOR | CFM_BACKCOLOR |
+                   CFM_SIZE | CFM_FACE | CFM_CHARSET;
+    cf.dwEffects = CFE_AUTOCOLOR | CFE_AUTOBACKCOLOR;
+    cf.yHeight   = 240; // 12pt default
+    cf.bCharSet  = DEFAULT_CHARSET;
+    wcsncpy_s(cf.szFaceName, L"Segoe UI", LF_FACESIZE - 1);
+    SendMessageW(hEdit, EM_SETCHARFORMAT, SCF_SELECTION, (LPARAM)&cf);
+}
+
+// ── Horizontal rule helpers — implementations are after Ne_ShowHRulePropsDialog ─
+static bool Ne_CaretOnHRule(HWND hEdit)
+{
+    PARAFORMAT2 pf = {}; pf.cbSize = sizeof(pf);
+    pf.dwMask = PFM_BORDER | PFM_STYLE;
+    SendMessageW(hEdit, EM_GETPARAFORMAT, 0, (LPARAM)&pf);
+    // any stored border value marks an HR paragraph
+    return pf.sStyle == 42 || pf.wBorders != 0;
+}
+static void Ne_InsertHRule(HWND hwnd, HWND hEdit);    // defined after Ne_ShowHRulePropsDialog
+static void Ne_EditHRuleProps(HWND hwnd, HWND hEdit);  // defined after Ne_ShowHRulePropsDialog
+static void Ne_RebuildHRList(HWND hEdit);              // defined near Ne_PaintHRules
+
+// ── Toggle word wrap (wrap to window ↔ no wrap) ───────────────────────────────
+static bool s_wordWrapOn = true;
+static void Ne_ToggleWordWrap(HWND hwnd, HWND hEdit)
+{
+    s_wordWrapOn = !s_wordWrapOn;
+    // EM_SETTARGETDEVICE: 0 = wrap to window, large value = no wrap
+    SendMessageW(hEdit, EM_SETTARGETDEVICE, 0, s_wordWrapOn ? 0 : 30000);
+    // Sync button state
+    HWND hBtn = GetDlgItem(hwnd, IDC_NE_WORDWRAP);
+    if (hBtn) SendMessageW(hBtn, BM_SETCHECK, s_wordWrapOn ? BST_CHECKED : BST_UNCHECKED, 0);
+}
+
+// ── Toggle character case: UPPER → lower → Title → UPPER ─────────────────────
+static void Ne_ToggleCase(HWND hEdit)
+{
+    CHARRANGE cr = {};
+    SendMessageW(hEdit, EM_EXGETSEL, 0, (LPARAM)&cr);
+    if (cr.cpMin == cr.cpMax) return; // nothing selected
+
+    int len = cr.cpMax - cr.cpMin;
+    std::wstring buf(len + 1, L'\0');
+    SendMessageW(hEdit, EM_GETSELTEXT, 0, (LPARAM)buf.data());
+    buf.resize(len);
+
+    // Detect current state: all upper → go lower; all lower → go Title; else → UPPER
+    bool allUpper = true, allLower = true;
+    for (wchar_t c : buf) {
+        if (isalpha((unsigned)c)) {
+            if (iswlower(c)) allUpper = false;
+            if (iswupper(c)) allLower = false;
+        }
+    }
+
+    std::wstring out = buf;
+    if (allUpper) {
+        // UPPER → lower
+        for (auto& c : out) c = towlower(c);
+    } else if (allLower) {
+        // lower → Title
+        bool capNext = true;
+        for (auto& c : out) {
+            if (iswspace(c)) { capNext = true; }
+            else if (capNext && iswalpha(c)) { c = towupper(c); capNext = false; }
+            else capNext = false;
+        }
+    } else {
+        // mixed → UPPER
+        for (auto& c : out) c = towupper(c);
+    }
+
+    // Replace selection with transformed text (preserve formatting).
+    SendMessageW(hEdit, EM_REPLACESEL, TRUE, (LPARAM)out.c_str());
+    // Restore selection span.
+    cr.cpMax = cr.cpMin + (LONG)out.size();
+    SendMessageW(hEdit, EM_EXSETSEL, 0, (LPARAM)&cr);
+}
+
 // ── Image insertion (PNG / JPEG → \pict hex in RTF stream) ────────────────────
 enum class NeImgFmt { Unknown, PNG, JPEG };
 struct NeImgInfo { NeImgFmt fmt; int w, h; };
@@ -431,6 +678,9 @@ static void Ne_SyncToolbar(HWND hwnd, HWND hEdit)
 }
 
 // ── Title and status bar ───────────────────────────────────────────────────────
+// Forward declarations — defined later after NeEncoding helpers.
+static const wchar_t* Ne_EncLabel(NeEncoding enc);
+static bool           Ne_DocIsRtf(NeTabDoc* doc);
 static void Ne_UpdateTitle(HWND hwnd)
 {
     NeTabDoc* doc = NeTabs_GetActiveDoc(hwnd);
@@ -473,6 +723,10 @@ static void Ne_UpdateStatusText(HWND hwnd)
     }
     bool modified = doc ? doc->modified : false;
     NeStatusBar_Update(hSb, words, chars, modified);
+
+    // Centre info: encoding / file type
+    NeEncoding enc = doc ? (NeEncoding)doc->encoding : NeEncoding::Unknown;
+    NeStatusBar_SetInfo(hSb, Ne_EncLabel(enc));
 }
 
 enum class NeBtnTone { Blue, Green, Red };
@@ -483,6 +737,7 @@ struct NeDialogButtonSpec {
     NeBtnTone tone;
     const wchar_t* iconRes;
     int width;
+    HICON hIconOverride = NULL;  // if set, used instead of iconRes
 };
 
 struct NeDialogData {
@@ -493,6 +748,8 @@ struct NeDialogData {
     int closeResult = IDCANCEL;
     int buttonCount = 0;
     NeDialogButtonSpec buttons[3];
+    HICON hMsgIcon = NULL;   // optional left-side icon (e.g. IDI_WARNING)
+    HFONT hDlgFont = NULL;   // created in WM_CREATE, deleted in WM_NCDESTROY
 };
 
 static bool Ne_PromptSaveIfModified(HWND hwnd); // forward
@@ -613,7 +870,9 @@ static void Ne_DrawDialogButton(const DRAWITEMSTRUCT* dis, const NeDialogData* d
     int startX = rc.left + ((rc.right - rc.left) - contentW) / 2;
     int iconY = rc.top + ((rc.bottom - rc.top) - S(16)) / 2;
 
-    HICON hIcon = LoadIconW(NULL, b.iconRes ? b.iconRes : IDI_INFORMATION);
+    HICON hIcon = b.hIconOverride
+        ? b.hIconOverride
+        : LoadIconW(NULL, b.iconRes ? b.iconRes : IDI_INFORMATION);
     if (hIcon) DrawIconEx(hdc, startX, iconY, hIcon, S(16), S(16), 0, NULL, DI_NORMAL);
 
     RECT tr = rc;
@@ -673,14 +932,27 @@ static LRESULT CALLBACK Ne_DialogWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
             SendMessageW(hwnd, WM_SETICON, ICON_BIG, (LPARAM)hIco);
         }
 
+        dd->hDlgFont = Ne_CreateDialogFont(false);
+
         RECT rc = {}; GetClientRect(hwnd, &rc);
         const int padH = S(20), padT = S(18), padB = S(15), gapTB = S(14), btnH = S(34), btnGap = S(10);
 
+        // Optional left-side icon (warning / info)
+        int iconW = 0;
+        if (dd->hMsgIcon) {
+            iconW = S(32) + S(12);
+            HWND hIcoCtrl = CreateWindowExW(0, L"STATIC", L"",
+                WS_CHILD | WS_VISIBLE | SS_ICON | SS_CENTERIMAGE,
+                padH, padT, S(32), S(32),
+                hwnd, NULL, hi, NULL);
+            if (hIcoCtrl) SendMessageW(hIcoCtrl, STM_SETICON, (WPARAM)dd->hMsgIcon, 0);
+        }
+
         HWND hTxt = CreateWindowExW(0, L"STATIC", dd->message.c_str(),
-            WS_CHILD | WS_VISIBLE | SS_CENTER,
-            padH, padT, rc.right - 2 * padH, dd->textH,
+            WS_CHILD | WS_VISIBLE | (dd->hMsgIcon ? SS_LEFT : SS_CENTER),
+            padH + iconW, padT, rc.right - 2 * padH - iconW, dd->textH,
             hwnd, (HMENU)(UINT_PTR)IDC_NE_DLG_TEXT, hi, NULL);
-        if (hTxt) SendMessageW(hTxt, WM_SETFONT, (WPARAM)GetStockObject(DEFAULT_GUI_FONT), TRUE);
+        if (hTxt) SendMessageW(hTxt, WM_SETFONT, (WPARAM)dd->hDlgFont, TRUE);
 
         int totalW = 0;
         for (int i = 0; i < dd->buttonCount; ++i) {
@@ -705,6 +977,9 @@ static LRESULT CALLBACK Ne_DialogWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
         }
         return 0;
     }
+    case WM_NCDESTROY:
+        if (dd && dd->hDlgFont) { DeleteObject(dd->hDlgFont); dd->hDlgFont = NULL; }
+        break;
     case WM_DRAWITEM:
         Ne_DrawDialogButton((const DRAWITEMSTRUCT*)lParam, dd);
         return TRUE;
@@ -734,7 +1009,8 @@ static LRESULT CALLBACK Ne_DialogWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
 }
 
 static int Ne_ShowChoiceDialog(HWND parent, const wchar_t* title, const std::wstring& message,
-                               NeDialogButtonSpec* buttons, int buttonCount, int closeResult)
+                               NeDialogButtonSpec* buttons, int buttonCount, int closeResult,
+                               HICON hMsgIcon = NULL)
 {
     if (buttonCount <= 0 || buttonCount > 3) return closeResult;
 
@@ -786,6 +1062,7 @@ static int Ne_ShowChoiceDialog(HWND parent, const wchar_t* title, const std::wst
     dd.result = closeResult;
     dd.buttonCount = buttonCount;
     for (int i = 0; i < buttonCount; ++i) dd.buttons[i] = buttons[i];
+    dd.hMsgIcon = hMsgIcon;
 
     HWND dlg = CreateWindowExW(WS_EX_DLGMODALFRAME,
         wc.lpszClassName, dd.title.c_str(),
@@ -1107,6 +1384,1809 @@ static const ShortcutRow s_shortcuts[] = {
 };
 static const int s_shortcutCount = (int)(sizeof(s_shortcuts) / sizeof(s_shortcuts[0]));
 
+// ── Shared helper: create a 12pt Segoe UI dialog font ─────────────────────────
+static HFONT Ne_MakeDlgFont(HWND hwnd, bool bold = false)
+{
+    NONCLIENTMETRICSW ncm = {}; ncm.cbSize = sizeof(ncm);
+    SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm, 0);
+    ncm.lfMessageFont.lfHeight  = -MulDiv(12, GetDpiForWindow(hwnd) > 0 ? GetDpiForWindow(hwnd) : GetDpiForSystem(), 72);
+    ncm.lfMessageFont.lfQuality = CLEARTYPE_QUALITY;
+    if (bold) ncm.lfMessageFont.lfWeight = FW_BOLD;
+    return CreateFontIndirectW(&ncm.lfMessageFont);
+}
+// Apply font to all child controls of dlg.
+static void Ne_ApplyDlgFont(HWND dlg, HFONT hf)
+{
+    EnumChildWindows(dlg, [](HWND h, LPARAM lp) -> BOOL {
+        SendMessageW(h, WM_SETFONT, lp, TRUE);
+        return TRUE;
+    }, (LPARAM)hf);
+}
+
+// ── Find / Replace dialog (modeless) ─────────────────────────────────────────
+static HWND s_hwndFind = NULL;
+static HWND s_hwndFindEdit = NULL;  // the hEdit to search in (updated when opened)
+
+static void Ne_DoFindNext(HWND dlg, bool forward = true)
+{
+    HWND hWhat  = GetDlgItem(dlg, IDC_NE_DLG_FIND_WHAT);
+    HWND hEdit  = s_hwndFindEdit;
+    if (!hWhat || !hEdit) return;
+
+    wchar_t buf[512] = {};
+    GetWindowTextW(hWhat, buf, 512);
+    if (!buf[0]) return;
+
+    bool matchCase  = (SendMessageW(GetDlgItem(dlg, IDC_NE_DLG_MATCHCASE), BM_GETCHECK, 0, 0) == BST_CHECKED);
+    bool wholeWord  = (SendMessageW(GetDlgItem(dlg, IDC_NE_DLG_WHOLEWORD), BM_GETCHECK, 0, 0) == BST_CHECKED);
+
+    CHARRANGE cr = {};
+    SendMessageW(hEdit, EM_EXGETSEL, 0, (LPARAM)&cr);
+
+    FINDTEXTEXW ft = {};
+    ft.lpstrText = buf;
+    DWORD flags = FR_DOWN;
+    if (matchCase)  flags |= FR_MATCHCASE;
+    if (wholeWord)  flags |= FR_WHOLEWORD;
+    if (!forward)   flags &= ~FR_DOWN;
+
+    // Start search from end (or start) of current selection.
+    ft.chrg.cpMin = forward ? cr.cpMax : cr.cpMin - 1;
+    ft.chrg.cpMax = -1;
+    if (ft.chrg.cpMin < 0) ft.chrg.cpMin = 0;
+
+    LRESULT pos = SendMessageW(hEdit, EM_FINDTEXTEXW, (WPARAM)flags, (LPARAM)&ft);
+    if (pos < 0) {
+        // Wrap around.
+        ft.chrg.cpMin = forward ? 0 : -1;
+        ft.chrg.cpMax = forward ? -1 : cr.cpMin;
+        pos = SendMessageW(hEdit, EM_FINDTEXTEXW, (WPARAM)flags, (LPARAM)&ft);
+    }
+    if (pos >= 0) {
+        SendMessageW(hEdit, EM_EXSETSEL, 0, (LPARAM)&ft.chrgText);
+        SendMessageW(hEdit, EM_SCROLLCARET, 0, 0);
+    } else {
+        MessageBoxW(dlg, Ls(L"MSG_FIND_NOT_FOUND"), Ls(L"DLG_FIND"), MB_OK | MB_ICONINFORMATION);
+    }
+}
+static void Ne_DoReplace(HWND dlg, bool all)
+{
+    HWND hWhat  = GetDlgItem(dlg, IDC_NE_DLG_FIND_WHAT);
+    HWND hWith  = GetDlgItem(dlg, IDC_NE_DLG_REPL_WITH);
+    HWND hEdit  = s_hwndFindEdit;
+    if (!hWhat || !hWith || !hEdit) return;
+
+    wchar_t what[512] = {}, with[512] = {};
+    GetWindowTextW(hWhat, what, 512);
+    GetWindowTextW(hWith, with, 512);
+    if (!what[0]) return;
+
+    bool matchCase = (SendMessageW(GetDlgItem(dlg, IDC_NE_DLG_MATCHCASE), BM_GETCHECK, 0, 0) == BST_CHECKED);
+    bool wholeWord = (SendMessageW(GetDlgItem(dlg, IDC_NE_DLG_WHOLEWORD), BM_GETCHECK, 0, 0) == BST_CHECKED);
+    DWORD flags = FR_DOWN | (matchCase ? FR_MATCHCASE : 0) | (wholeWord ? FR_WHOLEWORD : 0);
+
+    if (all) {
+        // Replace all: start from top.
+        CHARRANGE cr0 = { 0, 0 };
+        SendMessageW(hEdit, EM_EXSETSEL, 0, (LPARAM)&cr0);
+        int count = 0;
+        FINDTEXTEXW ft = {}; ft.lpstrText = what;
+        ft.chrg.cpMin = 0; ft.chrg.cpMax = -1;
+        while (SendMessageW(hEdit, EM_FINDTEXTEXW, (WPARAM)flags, (LPARAM)&ft) >= 0) {
+            SendMessageW(hEdit, EM_EXSETSEL, 0, (LPARAM)&ft.chrgText);
+            SendMessageW(hEdit, EM_REPLACESEL, TRUE, (LPARAM)with);
+            count++;
+            ft.chrg.cpMin = ft.chrgText.cpMin + (LONG)wcslen(with);
+            ft.chrg.cpMax = -1;
+            if (ft.chrg.cpMin < 0) break;
+        }
+        if (count == 0)
+            MessageBoxW(dlg, Ls(L"MSG_FIND_NOT_FOUND"), Ls(L"DLG_FIND"), MB_OK | MB_ICONINFORMATION);
+    } else {
+        // Replace current selection if it matches, then find next.
+        CHARRANGE cr = {};
+        SendMessageW(hEdit, EM_EXGETSEL, 0, (LPARAM)&cr);
+        if (cr.cpMin != cr.cpMax) {
+            // Check if current selection equals search term.
+            int selLen = cr.cpMax - cr.cpMin;
+            std::wstring selText(selLen + 1, L'\0');
+            SendMessageW(hEdit, EM_GETSELTEXT, 0, (LPARAM)selText.data());
+            selText.resize(selLen);
+            bool matches = matchCase ? (selText == what) : (_wcsicmp(selText.c_str(), what) == 0);
+            if (matches) {
+                SendMessageW(hEdit, EM_REPLACESEL, TRUE, (LPARAM)with);
+            }
+        }
+        Ne_DoFindNext(dlg, true);
+    }
+}
+
+static void Ne_ShowFindDialog(HWND parent, HWND hEdit)
+{
+    HINSTANCE hi = GetModuleHandleW(NULL);
+    s_hwndFindEdit = hEdit;
+
+    if (s_hwndFind && IsWindow(s_hwndFind)) {
+        SetForegroundWindow(s_hwndFind);
+        return;
+    }
+
+    WNDCLASSW wc = {};
+    wc.lpfnWndProc   = [](HWND h, UINT m, WPARAM w, LPARAM l) -> LRESULT {
+        if (m == WM_COMMAND) {
+            int id = LOWORD(w);
+            if (id == IDCANCEL || id == IDOK) { DestroyWindow(h); return 0; }
+            if (id == IDC_NE_DLG_FIND_NEXT)   { Ne_DoFindNext(h, true);  return 0; }
+            if (id == IDC_NE_DLG_REPLACE)      { Ne_DoReplace(h, false); return 0; }
+            if (id == IDC_NE_DLG_REPLACE_ALL)  { Ne_DoReplace(h, true);  return 0; }
+        }
+        if (m == WM_KEYDOWN && w == VK_ESCAPE) { DestroyWindow(h); return 0; }
+        if (m == WM_DESTROY) {
+            HFONT hf = (HFONT)GetWindowLongPtrW(h, GWLP_USERDATA);
+            if (hf) DeleteObject(hf);
+            s_hwndFind = NULL;
+            return 0;
+        }
+        return DefWindowProcW(h, m, w, l);
+    };
+    wc.hInstance     = hi;
+    wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+    wc.lpszClassName = L"NsbFindClass";
+    if (!GetClassInfoW(hi, wc.lpszClassName, &wc)) RegisterClassW(&wc);
+
+    const int W = S(440), H = S(220);
+    RECT pr = {}; if (parent) GetWindowRect(parent, &pr);
+    int x = (pr.left + pr.right) / 2 - W / 2, y = (pr.top + pr.bottom) / 2 - H / 2;
+    if (y < 30) y = 30;
+
+    s_hwndFind = CreateWindowExW(WS_EX_DLGMODALFRAME | WS_EX_WINDOWEDGE,
+        L"NsbFindClass", Ls(L"DLG_FIND"),
+        WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
+        x, y, W, H, parent, NULL, hi, NULL);
+    if (!s_hwndFind) return;
+
+    HFONT hf = Ne_MakeDlgFont(s_hwndFind);
+    SetWindowLongPtrW(s_hwndFind, GWLP_USERDATA, (LONG_PTR)hf);
+
+    RECT rc; GetClientRect(s_hwndFind, &rc);
+    const int P = S(10), LH = S(24), EB = S(22), CB = S(26);
+    int y0 = P;
+
+    auto mkLbl = [&](const wchar_t* t, int yy) {
+        HWND h = CreateWindowExW(0, L"STATIC", t, WS_CHILD|WS_VISIBLE, P, yy+S(3), S(110), LH, s_hwndFind, NULL, hi, NULL);
+        if (hf) SendMessageW(h, WM_SETFONT, (WPARAM)hf, TRUE);
+    };
+    auto mkEdit = [&](int id, int yy) {
+        HWND h = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+            WS_CHILD|WS_VISIBLE|ES_AUTOHSCROLL,
+            P+S(115), yy, rc.right - P*2 - S(115), EB, s_hwndFind, (HMENU)(UINT_PTR)id, hi, NULL);
+        if (hf) SendMessageW(h, WM_SETFONT, (WPARAM)hf, TRUE);
+        return h;
+    };
+    auto mkCheck = [&](int id, const wchar_t* t, int xx, int yy) {
+        HWND h = CreateWindowExW(0, L"BUTTON", t, WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX,
+            xx, yy, S(130), LH, s_hwndFind, (HMENU)(UINT_PTR)id, hi, NULL);
+        if (hf) SendMessageW(h, WM_SETFONT, (WPARAM)hf, TRUE);
+    };
+    auto mkBtn = [&](int id, const wchar_t* t, int xx, int yy, int bw, bool def_) {
+        DWORD sty = WS_CHILD|WS_VISIBLE|(def_ ? BS_DEFPUSHBUTTON : BS_PUSHBUTTON);
+        HWND h = CreateWindowExW(0, L"BUTTON", t, sty, xx, yy, bw, CB, s_hwndFind, (HMENU)(UINT_PTR)id, hi, NULL);
+        if (hf) SendMessageW(h, WM_SETFONT, (WPARAM)hf, TRUE);
+    };
+
+    mkLbl(Ls(L"DLG_FIND_WHAT"), y0);
+    HWND hFW = mkEdit(IDC_NE_DLG_FIND_WHAT, y0); y0 += EB + P;
+
+    mkLbl(Ls(L"DLG_REPL_WITH"), y0);
+    mkEdit(IDC_NE_DLG_REPL_WITH, y0); y0 += EB + P;
+
+    mkCheck(IDC_NE_DLG_MATCHCASE, Ls(L"CHK_MATCHCASE"), P,           y0);
+    mkCheck(IDC_NE_DLG_WHOLEWORD, Ls(L"CHK_WHOLEWORD"), P + S(145),  y0);
+    y0 += LH + P;
+
+    int bw = S(110), bx = rc.right - P - bw;
+    mkBtn(IDCANCEL,                L"Close",                 bx, y0, bw, false); bx -= bw + S(6);
+    mkBtn(IDC_NE_DLG_REPLACE_ALL, Ls(L"BTN_REPLACE_ALL"),   bx, y0, bw, false); bx -= bw + S(6);
+    mkBtn(IDC_NE_DLG_REPLACE,     Ls(L"BTN_REPLACE"),       bx, y0, bw, false); bx -= bw + S(6);
+    mkBtn(IDC_NE_DLG_FIND_NEXT,   Ls(L"BTN_FIND_NEXT"),     bx, y0, bw, true);
+
+    SetFocus(hFW);
+}
+
+// ── Insert Link dialog ────────────────────────────────────────────────────────
+static struct { int result; wchar_t url[2048]; wchar_t text[2048]; } s_linkDD;
+static NeDialogData s_linkBtnDD;
+
+static LRESULT CALLBACK Ne_LinkDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+    switch (msg) {
+    case WM_DRAWITEM:
+        if (((const DRAWITEMSTRUCT*)lParam)->CtlType == ODT_BUTTON) {
+            Ne_DrawDialogButton((const DRAWITEMSTRUCT*)lParam, &s_linkBtnDD);
+            return TRUE;
+        }
+        break;
+    case WM_COMMAND:
+        if (HIWORD(wParam) == BN_CLICKED) {
+            int id = LOWORD(wParam);
+            if (id == IDOK) {
+                wchar_t urlBuf[2048] = {};
+                GetWindowTextW(GetDlgItem(hwnd, IDC_NE_DLG_LINK_URL), urlBuf, 2048);
+
+                // Full regex URL validation.
+                // label    = [a-zA-Z0-9][a-zA-Z0-9\-]*  (one char min, hyphens ok mid)
+                // host     = (label.)+TLD
+                // TLD      = [a-zA-Z]{2,4}  (user spec: 2-4 alpha only)
+                // port     = :\d{1,5}
+                // path     = /[^\s]*
+                static const std::wregex s_urlRe(
+                    // ── http / https / ftp / ftps ──────────────────────────────────
+                    L"(https?|ftps?)://"
+                    L"([a-zA-Z0-9][a-zA-Z0-9\\-]*\\.)+"
+                    L"[a-zA-Z]{2,4}"
+                    L"(:\\d{1,5})?"
+                    L"(/[^\\s]*)?"
+                    L"|"
+                    // ── mailto ─────────────────────────────────────────────────────
+                    L"mailto:"
+                    L"[a-zA-Z0-9._%+\\-]+"
+                    L"@"
+                    L"([a-zA-Z0-9][a-zA-Z0-9\\-]*\\.)+"
+                    L"[a-zA-Z]{2,4}"
+                    L"|"
+                    // ── file ───────────────────────────────────────────────────────
+                    L"file://[^\\s]+"
+                    L"|"
+                    // ── bare www. (implied http) ───────────────────────────────────
+                    L"www\\."
+                    L"([a-zA-Z0-9][a-zA-Z0-9\\-]*\\.)+"
+                    L"[a-zA-Z]{2,4}"
+                    L"(:\\d{1,5})?"
+                    L"(/[^\\s]*)?" ,
+                    std::wregex::icase
+                );
+
+                bool valid = urlBuf[0] != L'\0' &&
+                             std::regex_match(std::wstring(urlBuf), s_urlRe);
+
+                if (!valid) {
+                    HICON hIconWarn = LoadIconW(NULL, IDI_WARNING);
+                    HICON hIconOk = NULL;
+                    ExtractIconExW(L"shell32.dll", 294, NULL, &hIconOk, 1);
+                    NeDialogButtonSpec okBtn = { IDOK, Ls(L"BTN_OK"),
+                                                NeBtnTone::Blue, IDI_INFORMATION, 0, hIconOk };
+                    Ne_ShowChoiceDialog(hwnd, Ls(L"DLG_LINK"),
+                                        Ls(L"MSG_LINK_BAD_URL"), &okBtn, 1, IDOK, hIconWarn);
+                    if (hIconOk) DestroyIcon(hIconOk);
+                    SetFocus(GetDlgItem(hwnd, IDC_NE_DLG_LINK_URL));
+                    return 0;
+                }
+                s_linkDD.result = IDOK;
+                wcscpy_s(s_linkDD.url, urlBuf);
+                GetWindowTextW(GetDlgItem(hwnd, IDC_NE_DLG_LINK_TEXT), s_linkDD.text, 2048);
+                DestroyWindow(hwnd);
+                return 0;
+            }
+            if (id == IDCANCEL) {
+                s_linkDD.result = IDCANCEL;
+                DestroyWindow(hwnd);
+                return 0;
+            }
+        }
+        break;
+    case WM_CTLCOLORSTATIC:
+        SetBkColor((HDC)wParam, GetSysColor(COLOR_WINDOW));
+        SetTextColor((HDC)wParam, RGB(20, 20, 20));
+        return (LRESULT)GetSysColorBrush(COLOR_WINDOW);
+    case WM_CLOSE:
+        s_linkDD.result = IDCANCEL;
+        DestroyWindow(hwnd);
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+static void Ne_ShowLinkDialog(HWND parent, HWND hEdit)
+{
+    HINSTANCE hi = GetModuleHandleW(NULL);
+
+    // Pre-fill URL if selection looks like a URL.
+    std::wstring selUrl, selText;
+    {
+        CHARRANGE cr = {};
+        SendMessageW(hEdit, EM_EXGETSEL, 0, (LPARAM)&cr);
+        int len = cr.cpMax - cr.cpMin;
+        if (len > 0 && len < 2048) {
+            std::wstring buf(len + 1, L'\0');
+            SendMessageW(hEdit, EM_GETSELTEXT, 0, (LPARAM)buf.data());
+            buf.resize(len);
+            if (buf.find(L"http") == 0 || buf.find(L"www.") == 0)
+                selUrl = buf;
+            else
+                selText = buf;
+        }
+    }
+
+    static bool registered = false;
+    if (!registered) {
+        WNDCLASSW wc = {};
+        wc.lpfnWndProc   = Ne_LinkDlgProc;
+        wc.hInstance     = hi;
+        wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+        wc.lpszClassName = L"NsbLinkClass";
+        RegisterClassW(&wc);
+        registered = true;
+    }
+
+    const int P = S(10), EB = S(22), CB = S(34);
+    int clientW = S(380);
+    int clientH = P + (EB + P) + (EB + P * 2) + CB + P;
+    RECT wr = { 0, 0, clientW, clientH };
+    AdjustWindowRectEx(&wr, WS_POPUP | WS_CAPTION | WS_SYSMENU, FALSE,
+                       WS_EX_DLGMODALFRAME | WS_EX_WINDOWEDGE);
+    int W = wr.right - wr.left, H = wr.bottom - wr.top;
+    RECT pr = {}; if (parent) GetWindowRect(parent, &pr);
+    int x = (pr.left + pr.right) / 2 - W / 2, y = (pr.top + pr.bottom) / 2 - H / 2;
+    if (y < 30) y = 30;
+
+    HWND dlg = CreateWindowExW(WS_EX_DLGMODALFRAME | WS_EX_WINDOWEDGE,
+        L"NsbLinkClass", Ls(L"DLG_LINK"),
+        WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
+        x, y, W, H, parent, NULL, hi, NULL);
+    if (!dlg) return;
+
+    HFONT hf = Ne_MakeDlgFont(dlg);
+    RECT rc; GetClientRect(dlg, &rc);
+    const int LH = S(22);
+    int y0 = P;
+
+    auto mkLbl = [&](const wchar_t* t, int yy) {
+        HWND h = CreateWindowExW(0, L"STATIC", t, WS_CHILD | WS_VISIBLE,
+            P, yy + S(3), S(110), LH, dlg, NULL, hi, NULL);
+        if (hf) SendMessageW(h, WM_SETFONT, (WPARAM)hf, TRUE);
+    };
+    auto mkEditF = [&](int id, const wchar_t* init, int yy) -> HWND {
+        HWND h = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", init,
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
+            P + S(115), yy, rc.right - P * 2 - S(115), EB,
+            dlg, (HMENU)(UINT_PTR)id, hi, NULL);
+        if (hf) SendMessageW(h, WM_SETFONT, (WPARAM)hf, TRUE);
+        return h;
+    };
+
+    mkLbl(Ls(L"DLG_LINK_URL"),  y0);
+    HWND hUrl = mkEditF(IDC_NE_DLG_LINK_URL,  selUrl.c_str(),  y0); y0 += EB + P;
+    mkLbl(Ls(L"DLG_LINK_TEXT"), y0);
+    mkEditF(IDC_NE_DLG_LINK_TEXT, selText.c_str(), y0); y0 += EB + P*2;
+
+    // Owner-draw buttons (same pattern as HR props / table props dialogs)
+    s_linkBtnDD = {};
+    s_linkBtnDD.buttonCount = 2;
+    s_linkBtnDD.buttons[0] = { IDOK,     Ls(L"BTN_SAVE"),   NeBtnTone::Blue, IDI_INFORMATION, Ne_MeasureButtonWidth(Ls(L"BTN_SAVE"))   };
+    s_linkBtnDD.buttons[1] = { IDCANCEL, Ls(L"BTN_CANCEL"), NeBtnTone::Red,  IDI_ERROR,       Ne_MeasureButtonWidth(Ls(L"BTN_CANCEL")) };
+    {
+        int totalBtnW = s_linkBtnDD.buttons[0].width + S(6) + s_linkBtnDD.buttons[1].width;
+        int bx2 = (rc.right - totalBtnW) / 2;
+        for (int i = 0; i < s_linkBtnDD.buttonCount; i++) {
+            auto& b = s_linkBtnDD.buttons[i];
+            DWORD sty = WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW;
+            if (b.id == IDOK) sty |= BS_DEFPUSHBUTTON;
+            HWND hBtn = CreateWindowExW(0, L"BUTTON", b.text.c_str(), sty,
+                bx2, y0, b.width, CB, dlg, (HMENU)(UINT_PTR)b.id, hi, NULL);
+            if (hBtn) {
+                WNDPROC prev = (WNDPROC)SetWindowLongPtrW(hBtn, GWLP_WNDPROC, (LONG_PTR)Ne_BtnHoverProc);
+                SetPropW(hBtn, L"NePrevProc", (HANDLE)prev);
+            }
+            bx2 += b.width + S(6);
+        }
+    }
+
+    if (parent) EnableWindow(parent, FALSE);
+    SetFocus(hUrl);
+
+    s_linkDD.result = IDCANCEL;
+    MSG m;
+    while (IsWindow(dlg) && GetMessageW(&m, NULL, 0, 0)) {
+        if (!IsDialogMessageW(dlg, &m)) { TranslateMessage(&m); DispatchMessageW(&m); }
+    }
+
+    if (parent) { EnableWindow(parent, TRUE); SetForegroundWindow(parent); }
+
+    if (s_linkDD.result == IDOK && s_linkDD.url[0]) {
+        const wchar_t* url  = s_linkDD.url;
+        const wchar_t* disp = s_linkDD.text[0] ? s_linkDD.text : url;
+        // Build RTF hyperlink: {\field{\*\fldinst{HYPERLINK "url"}}{\fldrslt display}}
+        std::wstring rtfW = L"{\\rtf1\\ansi{\\field{\\*\\fldinst{HYPERLINK \"";
+        rtfW += url;
+        rtfW += L"\"}}{\\fldrslt ";
+        rtfW += disp;
+        rtfW += L"}}";
+        rtfW += L"}";
+        // Convert to narrow for EM_STREAMIN.
+        int nb = WideCharToMultiByte(CP_ACP, 0, rtfW.c_str(), -1, NULL, 0, NULL, NULL);
+        std::string rtfA(nb, '\0');
+        WideCharToMultiByte(CP_ACP, 0, rtfW.c_str(), -1, &rtfA[0], nb, NULL, NULL);
+        NeStreamBuf rb = { &rtfA, 0 };
+        EDITSTREAM es = { (DWORD_PTR)&rb, 0, Ne_ReadCb };
+        SendMessageW(hEdit, EM_STREAMIN, SF_RTF | SFF_SELECTION, (LPARAM)&es);
+    }
+    SetFocus(hEdit);
+}
+
+// ── Insert Table dialog ───────────────────────────────────────────────────────
+// ── Table properties struct ───────────────────────────────────────────────────
+struct NeTableProps {
+    int rows      = 3;     // number of rows
+    int cols      = 3;     // number of columns
+    int cellW     = 1440;  // column width in twips (all cols equal)
+    int borderW   = 15;    // border width in half-points (15 = ~0.5 pt)
+    int gapH      = 108;   // \trgaph — half the inter-cell gap in twips
+    int padTop    = 0;     // \trpaddt in twips
+    int padBot    = 0;     // \trpaddb in twips
+    int padLeft   = 108;   // \trpaddl in twips
+    int padRight  = 108;   // \trpaddr in twips
+    int rowH      = 0;     // \trrh; 0 = auto, >0 = minimum (twips)
+    int tblAlign  = 0;     // 0=left,1=center,2=right  (\trql / \trqc / \trqr)
+    int leftIndent = 0;    // \trleft in twips
+};
+
+// Returns true when the caret / selection is inside a table row.
+// Does this by streaming out a single char around the caret as RTF and checking for \intbl.
+static bool Ne_CaretInTable(HWND hEdit)
+{
+    CHARRANGE crOrig = {};
+    SendMessageW(hEdit, EM_EXGETSEL, 0, (LPARAM)&crOrig);
+
+    // Probe the character AT the caret position.
+    // Use SFF_SELECTION so only that paragraph's properties are streamed,
+    // not the entire document (which would always return \intbl if any table exists).
+    int docLen = GetWindowTextLengthW(hEdit);
+    int probeMin = crOrig.cpMin;
+    int probeMax = probeMin + 1;
+    if (probeMax > docLen) {
+        probeMax = docLen;
+        probeMin = docLen > 0 ? docLen - 1 : 0;
+    }
+    if (probeMin >= probeMax) return false; // empty document
+
+    CHARRANGE crProbe = { probeMin, probeMax };
+    SendMessageW(hEdit, EM_EXSETSEL, 0, (LPARAM)&crProbe);
+    std::string rtf;
+    EDITSTREAM es = { (DWORD_PTR)&rtf, 0, Ne_WriteCb };
+    SendMessageW(hEdit, EM_STREAMOUT, SF_RTF | SFF_SELECTION, (LPARAM)&es);
+    SendMessageW(hEdit, EM_EXSETSEL, 0, (LPARAM)&crOrig);
+    return rtf.find("\\intbl") != std::string::npos;
+}
+
+// Parse the first \trowd block from an RTF string into NeTableProps.
+static NeTableProps Ne_ParseTableProps(const std::string& rtf)
+{
+    NeTableProps p;
+    // Find first \trowd
+    size_t pos = rtf.find("\\trowd");
+    if (pos == std::string::npos) return p;
+    // Find matching \row
+    size_t rowEnd = rtf.find("\\row", pos);
+    if (rowEnd == std::string::npos) rowEnd = rtf.size();
+    std::string block = rtf.substr(pos, rowEnd - pos);
+
+    auto readInt = [&](const std::string& key, int& out) {
+        size_t k = block.find(key);
+        if (k == std::string::npos) return;
+        k += key.size();
+        bool neg = (k < block.size() && block[k] == '-');
+        if (neg) k++;
+        if (k >= block.size() || !isdigit((unsigned char)block[k])) return;
+        int v = 0;
+        while (k < block.size() && isdigit((unsigned char)block[k]))
+            v = v * 10 + (block[k++] - '0');
+        out = neg ? -v : v;
+    };
+
+    readInt("\\trgaph",   p.gapH);
+    readInt("\\trleft",   p.leftIndent);
+    readInt("\\trpaddt",  p.padTop);
+    readInt("\\trpaddb",  p.padBot);
+    readInt("\\trpaddl",  p.padLeft);
+    readInt("\\trpaddr",  p.padRight);
+    readInt("\\trrh",     p.rowH);
+    if (block.find("\\trqc") != std::string::npos) p.tblAlign = 1;
+    else if (block.find("\\trqr") != std::string::npos) p.tblAlign = 2;
+    else p.tblAlign = 0;
+
+    // Count \cellx entries → columns
+    int cols = 0;
+    int lastCellX = 0;
+    size_t cx = 0;
+    while ((cx = block.find("\\cellx", cx)) != std::string::npos) {
+        cx += 6;
+        if (cx < block.size() && isdigit((unsigned char)block[cx])) {
+            int v = 0;
+            size_t t = cx;
+            while (t < block.size() && isdigit((unsigned char)block[t]))
+                v = v * 10 + (block[t++] - '0');
+            lastCellX = v;
+        }
+        cols++;
+    }
+    if (cols > 0) p.cols = cols;
+    if (cols > 0 && lastCellX > 0) p.cellW = lastCellX / cols;
+
+    // Extract border width from first \clbrdrX\brdrs\brdrwN
+    size_t bw = block.find("\\brdrw");
+    if (bw != std::string::npos) {
+        bw += 6;
+        int v = 0;
+        while (bw < block.size() && isdigit((unsigned char)block[bw]))
+            v = v * 10 + (block[bw++] - '0');
+        p.borderW = v;
+    }
+
+    // Count rows by counting \row occurrences in the full document section
+    int rows = 0;
+    size_t rp = 0;
+    while ((rp = rtf.find("\\row", rp)) != std::string::npos) {
+        // Make sure it's \row followed by non-alphanumeric (not \rowwidth etc.)
+        size_t after = rp + 4;
+        char next = (after < rtf.size()) ? rtf[after] : 0;
+        if (!isalpha((unsigned char)next)) rows++;
+        rp += 4;
+    }
+    if (rows > 0) p.rows = rows;
+
+    return p;
+}
+
+// Build RTF for a full table from NeTableProps.
+static std::string Ne_BuildTableRtf(const NeTableProps& p)
+{
+    const char* align = (p.tblAlign == 1) ? "\\trqc" :
+                        (p.tblAlign == 2) ? "\\trqr" : "";
+    std::string rtf = "{\\rtf1\\ansi ";
+    for (int r = 0; r < p.rows; r++) {
+        char hdr[256];
+        snprintf(hdr, sizeof(hdr),
+            "\\trowd%s\\trgaph%d\\trleft%d",
+            align, p.gapH, p.leftIndent);
+        rtf += hdr;
+        if (p.padTop || p.padBot || p.padLeft || p.padRight) {
+            char pad[128];
+            snprintf(pad, sizeof(pad),
+                "\\trpaddt%d\\trpaddb%d\\trpaddl%d\\trpaddr%d"
+                "\\trpaddft3\\trpaddfb3\\trpaddfl3\\trpaddfr3",
+                p.padTop, p.padBot, p.padLeft, p.padRight);
+            rtf += pad;
+        }
+        if (p.rowH != 0) {
+            char rh[32]; snprintf(rh, sizeof(rh), "\\trrh%d", p.rowH);
+            rtf += rh;
+        }
+        for (int c = 0; c < p.cols; c++) {
+            char bdr[256];
+            snprintf(bdr, sizeof(bdr),
+                "\\clbrdrt\\brdrs\\brdrw%d"
+                "\\clbrdrl\\brdrs\\brdrw%d"
+                "\\clbrdrb\\brdrs\\brdrw%d"
+                "\\clbrdrr\\brdrs\\brdrw%d",
+                p.borderW, p.borderW, p.borderW, p.borderW);
+            rtf += bdr;
+            char cx[32];
+            snprintf(cx, sizeof(cx), "\\cellx%d", p.cellW * (c + 1) + p.leftIndent);
+            rtf += cx;
+        }
+        for (int c = 0; c < p.cols; c++)
+            rtf += "\\intbl\\cell";
+        rtf += "\\row\r\n";
+    }
+    rtf += "\\pard\\par}";
+    return rtf;
+}
+
+// ── Control IDs used inside the table-properties dialog ──────────────────────
+#define IDC_TBLP_ROWS      260
+#define IDC_TBLP_COLS      261
+#define IDC_TBLP_CELLW     262
+#define IDC_TBLP_BORDERW   263
+#define IDC_TBLP_PADTOP    264
+#define IDC_TBLP_PADBOTTOM 265
+#define IDC_TBLP_PADLEFT   266
+#define IDC_TBLP_PADRIGHT  267
+#define IDC_TBLP_ROWH      268
+#define IDC_TBLP_ALIGN_L   270
+#define IDC_TBLP_ALIGN_C   271
+#define IDC_TBLP_ALIGN_R   272
+#define IDC_TBLP_MODE_ALTER  273
+#define IDC_TBLP_MODE_NESTED 274
+
+static NeDialogData s_tblPropsDD;
+static NeTableProps s_tblPropsResult;
+static bool         s_tblPropsModeAlter; // true = alter existing table, false = insert nested
+
+static LRESULT CALLBACK Ne_TblPropsDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+    switch (msg) {
+    case WM_COMMAND:
+        if (HIWORD(wParam) == BN_CLICKED) {
+            int cmd = LOWORD(wParam);
+            if (cmd == IDOK) {
+                // Read all control values BEFORE DestroyWindow kills the children
+                wchar_t buf[16];
+                auto rd = [&](int id) -> int {
+                    HWND h = GetDlgItem(hwnd, id);
+                    if (!h) return 0;
+                    GetWindowTextW(h, buf, 16);
+                    return _wtoi(buf);
+                };
+                s_tblPropsResult = {};
+                s_tblPropsResult.rows     = std::max(1, rd(IDC_TBLP_ROWS));
+                s_tblPropsResult.cols     = std::max(1, rd(IDC_TBLP_COLS));
+                int cellMm = std::max(5, rd(IDC_TBLP_CELLW));
+                s_tblPropsResult.cellW    = (int)(cellMm * 56.7 + 0.5);
+                s_tblPropsResult.borderW  = std::max(0, rd(IDC_TBLP_BORDERW));
+                s_tblPropsResult.padTop   = std::max(0, rd(IDC_TBLP_PADTOP))    * 20;
+                s_tblPropsResult.padBot   = std::max(0, rd(IDC_TBLP_PADBOTTOM)) * 20;
+                s_tblPropsResult.padLeft  = std::max(0, rd(IDC_TBLP_PADLEFT))   * 20;
+                s_tblPropsResult.padRight = std::max(0, rd(IDC_TBLP_PADRIGHT))  * 20;
+                s_tblPropsResult.rowH     = std::max(0, rd(IDC_TBLP_ROWH))      * 20;
+                s_tblPropsResult.tblAlign =
+                    SendMessageW(GetDlgItem(hwnd, IDC_TBLP_ALIGN_C), BM_GETCHECK, 0, 0) == BST_CHECKED ? 1
+                  : SendMessageW(GetDlgItem(hwnd, IDC_TBLP_ALIGN_R), BM_GETCHECK, 0, 0) == BST_CHECKED ? 2 : 0;
+                s_tblPropsResult.leftIndent = 0;
+                s_tblPropsResult.gapH       = 108;
+                // Mode (only relevant when inTable)
+                s_tblPropsModeAlter =
+                    GetDlgItem(hwnd, IDC_TBLP_MODE_ALTER) == NULL  // not in table → always insert
+                    || SendMessageW(GetDlgItem(hwnd, IDC_TBLP_MODE_ALTER), BM_GETCHECK, 0, 0) == BST_CHECKED;
+                s_tblPropsDD.result = IDOK;
+                DestroyWindow(hwnd);
+                return 0;
+            }
+            if (cmd == IDCANCEL) {
+                s_tblPropsDD.result = IDCANCEL;
+                DestroyWindow(hwnd);
+                return 0;
+            }
+        }
+        break;
+    case WM_DRAWITEM:
+        if (((const DRAWITEMSTRUCT*)lParam)->CtlType == ODT_BUTTON) {
+            Ne_DrawDialogButton((const DRAWITEMSTRUCT*)lParam, &s_tblPropsDD);
+            return TRUE;
+        }
+        break;
+    case WM_CTLCOLORSTATIC: {
+        HDC hdc = (HDC)wParam;
+        SetBkColor(hdc, GetSysColor(COLOR_WINDOW));
+        SetTextColor(hdc, RGB(20, 20, 20));
+        return (LRESULT)GetSysColorBrush(COLOR_WINDOW);
+    }
+    }
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+static void Ne_ShowTablePropsDialog(HWND parent, HWND hEdit)
+{
+    HINSTANCE hi = GetModuleHandleW(NULL);
+
+    // Detect context: are we inside a table already?
+    bool inTable = Ne_CaretInTable(hEdit);
+    NeTableProps props;
+    if (inTable) {
+        std::string full = Ne_StreamOut(hEdit, true);
+        props = Ne_ParseTableProps(full);
+    }
+
+    static bool registered = false;
+    if (!registered) {
+        WNDCLASSW wc = {};
+        wc.lpfnWndProc   = Ne_TblPropsDlgProc;
+        wc.hInstance     = hi;
+        wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+        wc.lpszClassName = L"NsbTablePropsClass";
+        RegisterClassW(&wc);
+        registered = true;
+    }
+
+    // Pre-compute required client size so window fits all controls exactly.
+    int neededClientH, neededClientW;
+    {
+        const int _P = S(10), _EB = S(22), _CB = S(34);
+        int ny = _P;
+        ny += _EB + S(6);   // rows
+        ny += _EB + S(6);   // cols
+        ny += _EB + S(10);  // cellW
+        ny += _EB + S(6);   // borderW
+        ny += _EB + S(4);   // padTop
+        ny += _EB + S(4);   // padBot
+        ny += _EB + S(4);   // padLeft
+        ny += _EB + S(10);  // padRight
+        ny += _EB + S(10);  // rowH
+        ny += S(22) + S(2) + S(22) + S(8); // align label + radio row
+        if (inTable) ny += S(22) + S(2) + S(22) + S(8); // mode label + radio row
+        int bw0 = Ne_MeasureButtonWidth(Ls(L"BTN_CANCEL"));
+        int bw1 = Ne_MeasureButtonWidth(Ls(L"BTN_APPLY"));
+        // Ensure wide enough for label+spin+unit columns and align group caption
+        HDC _hdc = GetDC(NULL);
+        HFONT _hf = Ne_CreateDialogFont(false);
+        HFONT _hfOld = _hf ? (HFONT)SelectObject(_hdc, _hf) : NULL;
+        SIZE _sz = {};
+        const wchar_t* _alignTxt = Ls(L"TBLP_ALIGN");
+        GetTextExtentPoint32W(_hdc, _alignTxt, (int)wcslen(_alignTxt), &_sz);
+        if (_hfOld) SelectObject(_hdc, _hfOld);
+        if (_hf) DeleteObject(_hf);
+        ReleaseDC(NULL, _hdc);
+        int minForAlign = _sz.cx + S(40); // caption + groupbox border padding
+        neededClientW = std::max({ S(370), bw0 + bw1 + S(6) + 2 * _P, minForAlign });
+        neededClientH = ny + _CB + _P;
+    }
+    RECT wr = { 0, 0, neededClientW, neededClientH };
+    AdjustWindowRectEx(&wr, WS_POPUP | WS_CAPTION | WS_SYSMENU, FALSE, WS_EX_DLGMODALFRAME | WS_EX_WINDOWEDGE);
+    int W = wr.right - wr.left, H = wr.bottom - wr.top;
+    RECT pr = {}; if (parent) GetWindowRect(parent, &pr);
+    int x = (pr.left + pr.right) / 2 - W / 2, y = (pr.top + pr.bottom) / 2 - H / 2;
+    if (y < 30) y = 30;
+
+    const wchar_t* title = inTable ? Ls(L"DLG_TABLE_PROPS") : Ls(L"DLG_TABLE_INSERT");
+    HWND dlg = CreateWindowExW(WS_EX_DLGMODALFRAME | WS_EX_WINDOWEDGE,
+        L"NsbTablePropsClass", title,
+        WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
+        x, y, W, H, parent, NULL, hi, NULL);
+    if (!dlg) return;
+
+    HFONT hf = Ne_MakeDlgFont(dlg);
+    RECT rc; GetClientRect(dlg, &rc);
+    const int P = S(10), EB = S(22), LH = S(22), CB = S(34);
+    const int LW = S(160), VX = S(170), VW = S(70);
+    int y0 = P;
+
+    // Helper: label + spin-edit pair
+    auto mkLbl = [&](const wchar_t* t, int yy) {
+        HWND h = CreateWindowExW(0, L"STATIC", t, WS_CHILD | WS_VISIBLE,
+            P, yy + S(3), LW, LH, dlg, NULL, hi, NULL);
+        if (hf) SendMessageW(h, WM_SETFONT, (WPARAM)hf, TRUE);
+    };
+    auto mkSpin = [&](int id, int yy, int initVal, int lo, int hi_) -> HWND {
+        HWND hEd = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+            WS_CHILD | WS_VISIBLE | ES_NUMBER | ES_CENTER,
+            VX, yy, VW, EB, dlg, (HMENU)(UINT_PTR)id, hi, NULL);
+        if (hf) SendMessageW(hEd, WM_SETFONT, (WPARAM)hf, TRUE);
+        wchar_t buf[16]; swprintf_s(buf, L"%d", initVal);
+        SetWindowTextW(hEd, buf);
+        HWND hSp = CreateWindowExW(0, UPDOWN_CLASSW, NULL,
+            WS_CHILD | WS_VISIBLE | UDS_ALIGNRIGHT | UDS_SETBUDDYINT | UDS_ARROWKEYS,
+            0, 0, 0, 0, dlg, NULL, hi, NULL);
+        SendMessageW(hSp, UDM_SETBUDDY,   (WPARAM)hEd, 0);
+        SendMessageW(hSp, UDM_SETRANGE32, lo, hi_);
+        SendMessageW(hSp, UDM_SETPOS32,   0, initVal);
+        return hEd;
+    };
+    // Unit label (e.g. "pt", "mm")
+    auto mkUnit = [&](const wchar_t* t, int yy) {
+        HWND h = CreateWindowExW(0, L"STATIC", t, WS_CHILD | WS_VISIBLE,
+            VX + VW + S(6), yy + S(3), S(60), LH, dlg, NULL, hi, NULL);
+        if (hf) SendMessageW(h, WM_SETFONT, (WPARAM)hf, TRUE);
+    };
+
+    // ── Mode (only shown when caret is inside a table) ───────────────────
+    if (inTable) {
+        const int RW2 = (rc.right - 2*P) / 2;
+        struct { int id; const wchar_t* key; bool presel; } mrdos[] = {
+            { IDC_TBLP_MODE_ALTER,  L"TBLP_MODE_ALTER",  true  },
+            { IDC_TBLP_MODE_NESTED, L"TBLP_MODE_NESTED", false },
+        };
+        for (int i = 0; i < 2; i++) {
+            DWORD grpFlag = (i == 0) ? WS_GROUP : 0;
+            HWND h = CreateWindowExW(0, L"BUTTON", Ls(mrdos[i].key),
+                WS_CHILD | WS_VISIBLE | BS_AUTORADIOBUTTON | grpFlag,
+                P + i * RW2, y0, RW2, LH, dlg,
+                (HMENU)(UINT_PTR)mrdos[i].id, hi, NULL);
+            if (hf) SendMessageW(h, WM_SETFONT, (WPARAM)hf, TRUE);
+            if (mrdos[i].presel) SendMessageW(h, BM_SETCHECK, BST_CHECKED, 0);
+        }
+        y0 += LH + S(8);
+    }
+
+    // ── Structure ──────────────────────────────────────────────────────────
+    mkLbl(Ls(L"TBLP_ROWS"),    y0);
+    HWND hRows = mkSpin(IDC_TBLP_ROWS, y0, props.rows, 1, 100);
+    y0 += EB + S(6);
+
+    mkLbl(Ls(L"TBLP_COLS"),    y0);
+    HWND hCols = mkSpin(IDC_TBLP_COLS, y0, props.cols, 1, 50);
+    y0 += EB + S(6);
+
+    // Column width: show in mm (1 mm ≈ 56.7 twips)
+    int cellMm = (int)(props.cellW / 56.7 + 0.5);
+    mkLbl(Ls(L"TBLP_CELLW"),   y0);
+    HWND hCellW = mkSpin(IDC_TBLP_CELLW, y0, cellMm, 5, 250);
+    mkUnit(L"mm", y0);
+    y0 += EB + S(10);
+
+    // ── Borders & padding ──────────────────────────────────────────────────
+    // Border width: show in half-points (15 = 0.75 pt is default)
+    mkLbl(Ls(L"TBLP_BORDERW"), y0);
+    HWND hBorderW = mkSpin(IDC_TBLP_BORDERW, y0, props.borderW, 0, 200);
+    mkUnit(Ls(L"TBLP_UNIT_HP"), y0);
+    y0 += EB + S(6);
+
+    // Cell padding (all sides in twips; show in pt, 1pt=20 twips)
+    int padTopPt   = (props.padTop   + 10) / 20;
+    int padBotPt   = (props.padBot   + 10) / 20;
+    int padLeftPt  = (props.padLeft  + 10) / 20;
+    int padRightPt = (props.padRight + 10) / 20;
+
+    mkLbl(Ls(L"TBLP_PAD_TOP"),   y0);
+    HWND hPadTop = mkSpin(IDC_TBLP_PADTOP, y0, padTopPt, 0, 100);
+    mkUnit(L"pt", y0); y0 += EB + S(4);
+
+    mkLbl(Ls(L"TBLP_PAD_BOTTOM"), y0);
+    HWND hPadBot = mkSpin(IDC_TBLP_PADBOTTOM, y0, padBotPt, 0, 100);
+    mkUnit(L"pt", y0); y0 += EB + S(4);
+
+    mkLbl(Ls(L"TBLP_PAD_LEFT"),  y0);
+    HWND hPadLeft = mkSpin(IDC_TBLP_PADLEFT, y0, padLeftPt, 0, 100);
+    mkUnit(L"pt", y0); y0 += EB + S(4);
+
+    mkLbl(Ls(L"TBLP_PAD_RIGHT"), y0);
+    HWND hPadRight = mkSpin(IDC_TBLP_PADRIGHT, y0, padRightPt, 0, 100);
+    mkUnit(L"pt", y0); y0 += EB + S(10);
+
+    // ── Row height ────────────────────────────────────────────────────────
+    int rowHPt = (int)(props.rowH / 20.0 + 0.5);
+    mkLbl(Ls(L"TBLP_ROWH"),    y0);
+    HWND hRowH = mkSpin(IDC_TBLP_ROWH, y0, rowHPt, 0, 1000);
+    mkUnit(Ls(L"TBLP_ROWH_UNIT"), y0);
+    y0 += EB + S(10);
+
+    // ── Alignment radio group ─────────────────────────────────────────────
+    {
+        HFONT hfBold = Ne_MakeDlgFont(dlg, true);
+        HWND hGrpLbl = CreateWindowExW(0, L"STATIC", Ls(L"TBLP_ALIGN"),
+            WS_CHILD | WS_VISIBLE,
+            P, y0, rc.right - 2*P, LH, dlg, NULL, hi, NULL);
+        if (hfBold) SendMessageW(hGrpLbl, WM_SETFONT, (WPARAM)hfBold, TRUE);
+        y0 += LH + S(2);
+
+        const int RW = (rc.right - 2*P) / 3;
+        struct { int id; const wchar_t* key; int align; } rdos[] = {
+            { IDC_TBLP_ALIGN_L, L"TBLP_ALIGN_L", 0 },
+            { IDC_TBLP_ALIGN_C, L"TBLP_ALIGN_C", 1 },
+            { IDC_TBLP_ALIGN_R, L"TBLP_ALIGN_R", 2 },
+        };
+        for (int i = 0; i < 3; i++) {
+            DWORD grpFlag = (i == 0) ? WS_GROUP : 0;
+            HWND h = CreateWindowExW(0, L"BUTTON", Ls(rdos[i].key),
+                WS_CHILD | WS_VISIBLE | BS_AUTORADIOBUTTON | grpFlag,
+                P + i * RW, y0, RW, LH, dlg,
+                (HMENU)(UINT_PTR)rdos[i].id, hi, NULL);
+            if (hf) SendMessageW(h, WM_SETFONT, (WPARAM)hf, TRUE);
+            if (rdos[i].align == props.tblAlign)
+                SendMessageW(h, BM_SETCHECK, BST_CHECKED, 0);
+        }
+        y0 += LH + S(8);
+    }
+
+    // ── Apply / Cancel (owner-draw, icon-tinted, i18n-measured) ─────────────
+    s_tblPropsDD = {};
+    s_tblPropsDD.buttonCount = 2;
+    s_tblPropsDD.buttons[0] = { IDOK,     Ls(L"BTN_APPLY"),  NeBtnTone::Blue, IDI_INFORMATION, Ne_MeasureButtonWidth(Ls(L"BTN_APPLY"))  };
+    s_tblPropsDD.buttons[1] = { IDCANCEL, Ls(L"BTN_CANCEL"), NeBtnTone::Red,  IDI_ERROR,       Ne_MeasureButtonWidth(Ls(L"BTN_CANCEL")) };
+
+    {
+        int totalBtnW = 0;
+        for (int i = 0; i < s_tblPropsDD.buttonCount; i++) {
+            totalBtnW += s_tblPropsDD.buttons[i].width;
+            if (i + 1 < s_tblPropsDD.buttonCount) totalBtnW += S(6);
+        }
+        int bx = (rc.right - totalBtnW) / 2;
+        for (int i = 0; i < s_tblPropsDD.buttonCount; i++) {
+            auto& b = s_tblPropsDD.buttons[i];
+            DWORD sty = WS_CHILD | WS_VISIBLE | BS_OWNERDRAW;
+            if (b.id == IDOK) sty |= BS_DEFPUSHBUTTON;
+            HWND hBtn = CreateWindowExW(0, L"BUTTON", b.text.c_str(), sty,
+                bx, y0, b.width, CB, dlg, (HMENU)(UINT_PTR)b.id, hi, NULL);
+            if (hBtn) {
+                WNDPROC prev = (WNDPROC)SetWindowLongPtrW(hBtn, GWLP_WNDPROC, (LONG_PTR)Ne_BtnHoverProc);
+                SetPropW(hBtn, L"NePrevProc", (HANDLE)prev);
+            }
+            bx += b.width + S(6);
+        }
+    }
+
+    if (parent) EnableWindow(parent, FALSE);
+    SetFocus(hRows);
+
+    MSG m;
+    s_tblPropsDD.result = IDCANCEL;
+    while (IsWindow(dlg) && GetMessageW(&m, NULL, 0, 0)) {
+        if (m.message == WM_KEYDOWN && m.wParam == VK_ESCAPE) { DestroyWindow(dlg); break; }
+        if (!IsDialogMessageW(dlg, &m)) { TranslateMessage(&m); DispatchMessageW(&m); }
+    }
+    bool ok = (s_tblPropsDD.result == IDOK);
+    if (parent) { EnableWindow(parent, TRUE); SetForegroundWindow(parent); }
+
+    if (ok) {
+        std::string tableRtf = Ne_BuildTableRtf(s_tblPropsResult);
+        NeStreamBuf sb = { &tableRtf, 0 };
+        EDITSTREAM es  = { (DWORD_PTR)&sb, 0, Ne_ReadCb };
+        if (inTable && s_tblPropsModeAlter) {
+            // Replace existing table: extend selection to cover all \intbl paragraphs
+            // around the caret, then stream in the replacement.
+            CHARRANGE cr;
+            SendMessageW(hEdit, EM_EXGETSEL, 0, (LPARAM)&cr);
+            int lineCount  = (int)SendMessageW(hEdit, EM_GETLINECOUNT, 0, 0);
+            int caretLine  = (int)SendMessageW(hEdit, EM_LINEFROMCHAR, (WPARAM)cr.cpMin, 0);
+            int firstRow   = caretLine, lastRow = caretLine;
+            SendMessageW(hEdit, WM_SETREDRAW, FALSE, 0);
+            for (int ln = caretLine - 1; ln >= 0; ln--) {
+                int idx = (int)SendMessageW(hEdit, EM_LINEINDEX, ln, 0);
+                CHARRANGE tr = { idx, idx + 1 };
+                SendMessageW(hEdit, EM_EXSETSEL, 0, (LPARAM)&tr);
+                std::string lineRtf = Ne_StreamOut(hEdit, false);
+                if (lineRtf.find("\\intbl") != std::string::npos) firstRow = ln;
+                else break;
+            }
+            for (int ln = caretLine + 1; ln < lineCount; ln++) {
+                int idx = (int)SendMessageW(hEdit, EM_LINEINDEX, ln, 0);
+                CHARRANGE tr = { idx, idx + 1 };
+                SendMessageW(hEdit, EM_EXSETSEL, 0, (LPARAM)&tr);
+                std::string lineRtf = Ne_StreamOut(hEdit, false);
+                if (lineRtf.find("\\intbl") != std::string::npos) lastRow = ln;
+                else break;
+            }
+            int selStart = (int)SendMessageW(hEdit, EM_LINEINDEX, firstRow, 0);
+            int lastIdx  = (int)SendMessageW(hEdit, EM_LINEINDEX, lastRow, 0);
+            int lastLen  = (int)SendMessageW(hEdit, EM_LINELENGTH, lastIdx, 0);
+            CHARRANGE selRange = { selStart, lastIdx + lastLen };
+            SendMessageW(hEdit, EM_EXSETSEL, 0, (LPARAM)&selRange);
+            SendMessageW(hEdit, WM_SETREDRAW, TRUE, 0);
+            SendMessageW(hEdit, EM_STREAMIN, SF_RTF | SFF_SELECTION, (LPARAM)&es);
+        } else {
+            // Insert new table at caret (plain insert or nested)
+            SendMessageW(hEdit, EM_STREAMIN, SF_RTF | SFF_SELECTION, (LPARAM)&es);
+        }
+    }
+    SetFocus(hEdit);
+}
+
+// ── RTF table insertion (shared by picker and dialog) ─────────────────────────
+static void Ne_InsertTableRtf(HWND hEdit, int rows, int cols)
+{
+    const int cellW = 1440;
+    std::string rtf = "{\\rtf1\\ansi ";
+    for (int r = 0; r < rows; r++) {
+        rtf += "\\trowd\\trgaph108\\trleft0";
+        for (int c = 0; c < cols; c++) {
+            rtf += "\\clbrdrt\\brdrs\\brdrw15"
+                   "\\clbrdrl\\brdrs\\brdrw15"
+                   "\\clbrdrb\\brdrs\\brdrw15"
+                   "\\clbrdrr\\brdrs\\brdrw15";
+            char cx[32]; snprintf(cx, sizeof(cx), "\\cellx%d", cellW * (c + 1));
+            rtf += cx;
+        }
+        for (int c = 0; c < cols; c++)
+            rtf += "\\intbl\\cell";
+        rtf += "\\row\r\n";
+    }
+    rtf += "\\pard\\par}";
+    NeStreamBuf sb = { &rtf, 0 };
+    EDITSTREAM es  = { (DWORD_PTR)&sb, 0, Ne_ReadCb };
+    SendMessageW(hEdit, EM_STREAMIN, SF_RTF | SFF_SELECTION, (LPARAM)&es);
+}
+
+// ── Table size grid picker (Word-style hover popup) ───────────────────────────
+static struct {
+    HWND  hEdit;
+    int   hoverC, hoverR;
+    HFONT hFont;
+} g_tblPick = {};
+
+static LRESULT CALLBACK Ne_TablePickerProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+    const int MAXC = 8, MAXR = 8;
+    const int CW = S(24), CH = S(20), PAD = S(6), LBLH = S(22);
+
+    switch (msg) {
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC hdc = BeginPaint(hwnd, &ps);
+        RECT rc; GetClientRect(hwnd, &rc);
+
+        // Background — tooltip colour
+        HBRUSH hBg = CreateSolidBrush(GetSysColor(COLOR_INFOBK));
+        FillRect(hdc, &rc, hBg);
+        DeleteObject(hBg);
+
+        // Outer border (1 px black, like tooltip)
+        HPEN hPen = CreatePen(PS_SOLID, 1, RGB(0, 0, 0));
+        HPEN hOldP = (HPEN)SelectObject(hdc, hPen);
+        MoveToEx(hdc, rc.left,      rc.top,        NULL);
+        LineTo  (hdc, rc.right - 1, rc.top);
+        LineTo  (hdc, rc.right - 1, rc.bottom - 1);
+        LineTo  (hdc, rc.left,      rc.bottom - 1);
+        LineTo  (hdc, rc.left,      rc.top);
+        SelectObject(hdc, hOldP);
+        DeleteObject(hPen);
+
+        // Grid cells
+        for (int r = 0; r < MAXR; r++) {
+            for (int c = 0; c < MAXC; c++) {
+                int x1 = PAD + c * CW, y1 = PAD + r * CH;
+                int x2 = x1 + CW,      y2 = y1 + CH;
+                bool sel = (c < g_tblPick.hoverC && r < g_tblPick.hoverR);
+                COLORREF fill   = sel ? RGB(180, 215, 255) : GetSysColor(COLOR_WINDOW);
+                COLORREF border = sel ? RGB(0, 120, 215)   : RGB(160, 160, 170);
+                HBRUSH hCb = CreateSolidBrush(fill);
+                RECT cr = { x1 + 1, y1 + 1, x2, y2 };
+                FillRect(hdc, &cr, hCb);
+                DeleteObject(hCb);
+                HPEN hCp = CreatePen(PS_SOLID, 1, border);
+                HPEN hOC = (HPEN)SelectObject(hdc, hCp);
+                MoveToEx(hdc, x1, y1, NULL);
+                LineTo(hdc, x2, y1); LineTo(hdc, x2, y2);
+                LineTo(hdc, x1, y2); LineTo(hdc, x1, y1);
+                SelectObject(hdc, hOC); DeleteObject(hCp);
+            }
+        }
+
+        // Label area
+        SetBkMode(hdc, TRANSPARENT);
+        if (g_tblPick.hFont) SelectObject(hdc, g_tblPick.hFont);
+        wchar_t lbl[48];
+        if (g_tblPick.hoverC > 0 && g_tblPick.hoverR > 0)
+            swprintf_s(lbl, Ls(L"TABLE_PICKER_FMT"), g_tblPick.hoverR, g_tblPick.hoverC);
+        else
+            wcscpy_s(lbl, Ls(L"TABLE_PICKER_HINT"));
+        SetTextColor(hdc, RGB(0, 0, 0));
+        RECT lr = { PAD, PAD + MAXR * CH + S(3), rc.right - PAD, rc.bottom - S(2) };
+        DrawTextW(hdc, lbl, -1, &lr, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+    case WM_MOUSEMOVE: {
+        int mx = (short)LOWORD(lParam), my = (short)HIWORD(lParam);
+        int nc = (mx < PAD || my < PAD) ? 0 : std::min((mx - PAD) / CW + 1, MAXC);
+        int nr = (mx < PAD || my < PAD) ? 0 : std::min((my - PAD) / CH + 1, MAXR);
+        if (my >= PAD + MAXR * CH) { nc = 0; nr = 0; }
+        if (nc != g_tblPick.hoverC || nr != g_tblPick.hoverR) {
+            g_tblPick.hoverC = nc;
+            g_tblPick.hoverR = nr;
+            InvalidateRect(hwnd, NULL, FALSE);
+        }
+        return 0;
+    }
+    case WM_LBUTTONDOWN: {
+        int mx = (short)LOWORD(lParam), my = (short)HIWORD(lParam);
+        int selC = (mx >= PAD) ? std::min((mx - PAD) / CW + 1, MAXC) : 0;
+        int selR = (my >= PAD) ? std::min((my - PAD) / CH + 1, MAXR) : 0;
+        bool inGrid = (selC >= 1 && selR >= 1 && my < PAD + MAXR * CH);
+        HWND hEd = g_tblPick.hEdit;
+        int r = selR, c = selC;
+        DestroyWindow(hwnd); // triggers WM_DESTROY which frees the font
+        if (inGrid) { Ne_InsertTableRtf(hEd, r, c); SetFocus(hEd); }
+        return 0;
+    }
+    case WM_ACTIVATE:
+        if (LOWORD(wParam) == WA_INACTIVE)
+            PostMessageW(hwnd, WM_CLOSE, 0, 0);
+        return 0;
+    case WM_KEYDOWN:
+        if (wParam == VK_ESCAPE) DestroyWindow(hwnd);
+        return 0;
+    case WM_CLOSE:
+        DestroyWindow(hwnd);
+        return 0;
+    case WM_DESTROY:
+        if (g_tblPick.hFont) { DeleteObject(g_tblPick.hFont); g_tblPick.hFont = NULL; }
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+static void Ne_ShowTablePicker(HWND hwndParent, HWND hEdit, HWND hBtn)
+{
+    HINSTANCE hi = GetModuleHandleW(NULL);
+    const int MAXC = 8, MAXR = 8;
+    const int CW = S(24), CH = S(20), PAD = S(6), LBLH = S(22);
+    const int W = PAD * 2 + MAXC * CW;
+    const int H = PAD * 2 + MAXR * CH + S(4) + LBLH;
+
+    static bool registered = false;
+    if (!registered) {
+        WNDCLASSW wc = {};
+        wc.lpfnWndProc   = Ne_TablePickerProc;
+        wc.hInstance     = hi;
+        wc.hbrBackground = (HBRUSH)(COLOR_INFOBK + 1);
+        wc.hCursor       = LoadCursorW(NULL, IDC_ARROW);
+        wc.lpszClassName = L"NsbTablePickerClass";
+        RegisterClassW(&wc);
+        registered = true;
+    }
+
+    // Position below the TABLE button; flip above if near screen bottom.
+    RECT br = {}; GetWindowRect(hBtn, &br);
+    int x = br.left, y = br.bottom + S(2);
+    if (y + H > GetSystemMetrics(SM_CYSCREEN)) y = br.top - H - S(2);
+
+    g_tblPick.hEdit  = hEdit;
+    g_tblPick.hoverC = 0;
+    g_tblPick.hoverR = 0;
+    if (g_tblPick.hFont) { DeleteObject(g_tblPick.hFont); g_tblPick.hFont = NULL; }
+    g_tblPick.hFont  = Ne_MakeDlgFont(hwndParent, true); // bold, matches tooltip style
+
+    HWND hPick = CreateWindowExW(WS_EX_TOPMOST,
+        L"NsbTablePickerClass", L"",
+        WS_POPUP | WS_VISIBLE,
+        x, y, W, H, hwndParent, NULL, hi, NULL);
+    if (hPick) SetFocus(hPick);
+}
+
+// ── Table dialog (kept for programmatic/large-table use) ─────────────────────
+static void Ne_ShowTableDialog(HWND parent, HWND hEdit)
+{
+    HINSTANCE hi = GetModuleHandleW(NULL);
+
+    WNDCLASSW wc = {};
+    wc.lpfnWndProc   = DefWindowProcW;
+    wc.hInstance     = hi;
+    wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+    wc.lpszClassName = L"NsbTableClass";
+    if (!GetClassInfoW(hi, wc.lpszClassName, &wc)) RegisterClassW(&wc);
+
+    const int W = S(300), H = S(155);
+    RECT pr = {}; if (parent) GetWindowRect(parent, &pr);
+    int x = (pr.left+pr.right)/2-W/2, y = (pr.top+pr.bottom)/2-H/2;
+    if (y < 30) y = 30;
+
+    HWND dlg = CreateWindowExW(WS_EX_DLGMODALFRAME|WS_EX_WINDOWEDGE,
+        L"NsbTableClass", Ls(L"DLG_TABLE"),
+        WS_POPUP|WS_CAPTION|WS_SYSMENU|WS_VISIBLE,
+        x, y, W, H, parent, NULL, hi, NULL);
+    if (!dlg) return;
+
+    HFONT hf = Ne_MakeDlgFont(dlg);
+    RECT rc; GetClientRect(dlg, &rc);
+    const int P = S(10), EB = S(22), LH = S(24), CB = S(26);
+    int y0 = P;
+
+    auto mkLbl = [&](const wchar_t* t, int xx, int yy) {
+        HWND h = CreateWindowExW(0,L"STATIC",t,WS_CHILD|WS_VISIBLE, xx,yy+S(3),S(100),LH,dlg,NULL,hi,NULL);
+        if(hf) SendMessageW(h,WM_SETFONT,(WPARAM)hf,TRUE);
+    };
+    auto mkSpin = [&](int id, int xx, int yy, int initVal) -> HWND {
+        HWND hEd = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+            WS_CHILD|WS_VISIBLE|ES_NUMBER|ES_CENTER,
+            xx, yy, S(50), EB, dlg, (HMENU)(UINT_PTR)id, hi, NULL);
+        if(hf) SendMessageW(hEd,WM_SETFONT,(WPARAM)hf,TRUE);
+        wchar_t buf[8]; swprintf_s(buf, L"%d", initVal);
+        SetWindowTextW(hEd, buf);
+        // Buddy spinner.
+        HWND hSp = CreateWindowExW(0, UPDOWN_CLASSW, NULL,
+            WS_CHILD|WS_VISIBLE|UDS_ALIGNRIGHT|UDS_SETBUDDYINT|UDS_ARROWKEYS,
+            0,0,0,0, dlg, NULL, hi, NULL);
+        SendMessageW(hSp, UDM_SETBUDDY,  (WPARAM)hEd, 0);
+        SendMessageW(hSp, UDM_SETRANGE32, 1, 20);
+        SendMessageW(hSp, UDM_SETPOS32,   0, initVal);
+        return hEd;
+    };
+
+    mkLbl(Ls(L"DLG_TABLE_ROWS"), P, y0);
+    HWND hRows = mkSpin(IDC_NE_DLG_TABLE_ROWS, P+S(105), y0, 3); y0 += EB + P;
+    mkLbl(Ls(L"DLG_TABLE_COLS"), P, y0);
+    HWND hCols = mkSpin(IDC_NE_DLG_TABLE_COLS, P+S(105), y0, 3); y0 += EB + P*2;
+
+    int bw = S(80);
+    int bx = rc.right - P - bw;
+    auto mkBtnT = [&](int id, const wchar_t* t, int xx, bool def_) {
+        DWORD sty = WS_CHILD|WS_VISIBLE|(def_?BS_DEFPUSHBUTTON:BS_PUSHBUTTON);
+        HWND h = CreateWindowExW(0,L"BUTTON",t,sty, xx,y0,bw,CB, dlg,(HMENU)(UINT_PTR)id,hi,NULL);
+        if(hf) SendMessageW(h,WM_SETFONT,(WPARAM)hf,TRUE);
+    };
+    mkBtnT(IDCANCEL, Ls(L"BTN_CANCEL"), bx, false); bx -= bw + S(6);
+    mkBtnT(IDOK,     Ls(L"BTN_SAVE"),   bx, true);
+
+    if (parent) EnableWindow(parent, FALSE);
+    SetFocus(hRows);
+
+    MSG m; bool ok = false;
+    while (IsWindow(dlg) && GetMessageW(&m, NULL, 0, 0)) {
+        if (m.message == WM_KEYDOWN && m.wParam == VK_ESCAPE) { DestroyWindow(dlg); break; }
+        if (!IsDialogMessageW(dlg, &m)) { TranslateMessage(&m); DispatchMessageW(&m); }
+        if (!IsWindow(dlg)) break;
+        if (m.message == WM_COMMAND && LOWORD(m.wParam) == IDOK && m.hwnd == dlg) { ok = true; break; }
+    }
+    if (parent) { EnableWindow(parent, TRUE); SetForegroundWindow(parent); }
+
+    if (ok && IsWindow(dlg)) {
+        wchar_t rb[8]={}, cb[8]={};
+        GetWindowTextW(hRows, rb, 8); GetWindowTextW(hCols, cb, 8);
+        DestroyWindow(dlg);
+        int rows = std::max(1, _wtoi(rb)), cols = std::max(1, _wtoi(cb));
+        Ne_InsertTableRtf(hEdit, rows, cols);
+    } else if (IsWindow(dlg)) {
+        DestroyWindow(dlg);
+    }
+    SetFocus(hEdit);
+}
+
+// ── Horizontal-rule properties dialog ─────────────────────────────────────────
+#define IDC_HRP_STYLE        280
+#define IDC_HRP_THICKNESS    281
+#define IDC_HRP_SPACE_ABOVE  282
+#define IDC_HRP_SPACE_BELOW  283
+#define IDC_HRP_COLOR        284   // "Choose Color…" button
+#define IDC_HRP_SWATCH       285   // color preview static
+#define IDC_HRP_WIDTH        286
+#define IDC_HRP_ALIGN_L      287
+#define IDC_HRP_ALIGN_C      288
+#define IDC_HRP_ALIGN_R      289
+
+struct NeHRuleProps {
+    int      styleIdx;    // 0=single thin .. 5=hairline
+    int      thickness;   // half-points (stored in wBorderWidth)
+    int      spaceBefore; // twips
+    int      spaceAfter;  // twips
+    COLORREF color;       // 24-bit RGB
+    int      widthPct;    // 10-100 (% of paragraph width)
+    int      align;       // 0=left, 1=center, 2=right
+};
+
+static const wchar_t* s_hrStyleName[6] = {
+    L"Single thin", L"Thick", L"Double", L"Dotted", L"Dashed", L"Hairline",
+};
+
+static NeDialogData s_hrPropsDD;
+static NeHRuleProps s_hrPropsResult;
+static HBRUSH       s_hrSwatchBrush  = NULL;
+static COLORREF     s_hrCustomColors[16] = {};
+
+static LRESULT CALLBACK Ne_HRulePropsDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+    switch (msg) {
+    case WM_COMMAND:
+        if (HIWORD(wParam) == BN_CLICKED) {
+            int cmd = LOWORD(wParam);
+            if (cmd == IDC_HRP_COLOR) {
+                CHOOSECOLORW cc = {};
+                cc.lStructSize  = sizeof(cc);
+                cc.hwndOwner    = hwnd;
+                cc.lpCustColors = s_hrCustomColors;
+                cc.rgbResult    = (COLORREF)(DWORD_PTR)GetWindowLongPtrW(
+                                      GetDlgItem(hwnd, IDC_HRP_SWATCH), GWLP_USERDATA);
+                cc.Flags        = CC_FULLOPEN | CC_RGBINIT;
+                if (ChooseColorW(&cc)) {
+                    HWND hSwatch = GetDlgItem(hwnd, IDC_HRP_SWATCH);
+                    SetWindowLongPtrW(hSwatch, GWLP_USERDATA, (LONG_PTR)(DWORD_PTR)cc.rgbResult);
+                    InvalidateRect(hSwatch, NULL, TRUE);
+                }
+                return 0;
+            }
+            if (cmd == IDOK) {
+                wchar_t buf[16];
+                auto rd = [&](int id) -> int {
+                    HWND h = GetDlgItem(hwnd, id);
+                    if (!h) return 0;
+                    GetWindowTextW(h, buf, 16);
+                    return _wtoi(buf);
+                };
+                s_hrPropsResult.styleIdx    = (int)SendMessageW(GetDlgItem(hwnd, IDC_HRP_STYLE), CB_GETCURSEL, 0, 0);
+                s_hrPropsResult.thickness   = std::max(1, rd(IDC_HRP_THICKNESS));
+                s_hrPropsResult.spaceBefore = std::max(0, rd(IDC_HRP_SPACE_ABOVE)) * 20;
+                s_hrPropsResult.spaceAfter  = std::max(0, rd(IDC_HRP_SPACE_BELOW)) * 20;
+                s_hrPropsResult.color       = (COLORREF)(DWORD_PTR)GetWindowLongPtrW(
+                                                  GetDlgItem(hwnd, IDC_HRP_SWATCH), GWLP_USERDATA);
+                s_hrPropsResult.widthPct    = std::max(10, std::min(100, rd(IDC_HRP_WIDTH)));
+                s_hrPropsResult.align       =
+                    (SendMessageW(GetDlgItem(hwnd, IDC_HRP_ALIGN_L), BM_GETCHECK, 0, 0) == BST_CHECKED) ? 0 :
+                    (SendMessageW(GetDlgItem(hwnd, IDC_HRP_ALIGN_R), BM_GETCHECK, 0, 0) == BST_CHECKED) ? 2 : 1;
+                if (s_hrPropsResult.styleIdx < 0) s_hrPropsResult.styleIdx = 0;
+                s_hrPropsDD.result = IDOK;
+                DestroyWindow(hwnd);
+                return 0;
+            }
+            if (cmd == IDCANCEL) {
+                s_hrPropsDD.result = IDCANCEL;
+                DestroyWindow(hwnd);
+                return 0;
+            }
+        }
+        break;
+    case WM_DRAWITEM:
+        if (((const DRAWITEMSTRUCT*)lParam)->CtlType == ODT_BUTTON) {
+            Ne_DrawDialogButton((const DRAWITEMSTRUCT*)lParam, &s_hrPropsDD);
+            return TRUE;
+        }
+        break;
+    case WM_CTLCOLORSTATIC: {
+        HWND hCtrl = (HWND)lParam;
+        if (GetDlgCtrlID(hCtrl) == IDC_HRP_SWATCH) {
+            COLORREF col = (COLORREF)(DWORD_PTR)GetWindowLongPtrW(hCtrl, GWLP_USERDATA);
+            if (s_hrSwatchBrush) { DeleteObject(s_hrSwatchBrush); s_hrSwatchBrush = NULL; }
+            s_hrSwatchBrush = CreateSolidBrush(col);
+            SetBkColor((HDC)wParam, col);
+            return (LRESULT)s_hrSwatchBrush;
+        }
+        SetBkColor((HDC)wParam, GetSysColor(COLOR_WINDOW));
+        SetTextColor((HDC)wParam, RGB(20, 20, 20));
+        return (LRESULT)GetSysColorBrush(COLOR_WINDOW);
+    }
+    }
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+static void Ne_ApplyHRuleProps(HWND hEdit, const NeHRuleProps& p)
+{
+    // wBorders (PARAFORMAT2):
+    //   Bits  0-7:  which sides (0x08 = bottom border)
+    //   Bits  8-11: style (1=¾pt solid, 2=1½pt, 3=2¼pt, 4=3pt, 5=4½pt, 6=6pt…)
+    //   Bits 12-15: fixed-palette color index (ignored; color set via CHARFORMAT2W)
+    // Compute left/right indents to achieve width% and alignment
+    RECT fmtRc = {};
+    SendMessageW(hEdit, EM_GETRECT, 0, (LPARAM)&fmtRc);
+    int pixW = fmtRc.right - fmtRc.left;
+    HDC hdc  = GetDC(hEdit);
+    int dpiX = GetDeviceCaps(hdc, LOGPIXELSX);
+    ReleaseDC(hEdit, hdc);
+    int twipW   = (dpiX > 0) ? MulDiv(pixW, 1440, dpiX) : 8640;
+    int narrow  = twipW - MulDiv(twipW, p.widthPct, 100);
+    LONG leftIn = (p.align == 0) ? 0L : (p.align == 2) ? (LONG)narrow : (LONG)(narrow / 2);
+    LONG rightIn = (LONG)narrow - leftIn;
+
+    PARAFORMAT2 pf = {}; pf.cbSize = sizeof(pf);
+    pf.dwMask        = PFM_BORDER | PFM_STYLE | PFM_SPACEBEFORE | PFM_SPACEAFTER
+                     | PFM_STARTINDENT | PFM_RIGHTINDENT | PFM_ALIGNMENT;
+    pf.sStyle        = 42;   // HR marker — more reliably stored than wBorders
+    pf.wBorders      = (WORD)(0x08 | ((p.styleIdx + 1) << 8));
+    pf.wBorderWidth  = (WORD)(p.thickness * 20);  // points → twips
+    pf.wBorderSpace  = 20;
+    pf.dySpaceBefore = (SHORT)p.spaceBefore;
+    pf.dySpaceAfter  = (SHORT)p.spaceAfter;
+    pf.dxStartIndent = leftIn;
+    pf.dxRightIndent = rightIn;
+    pf.wAlignment    = (p.align == 0) ? PFA_LEFT : (p.align == 2) ? PFA_RIGHT : PFA_CENTER;
+    SendMessageW(hEdit, EM_SETPARAFORMAT, 0, (LPARAM)&pf);
+    // Border is rendered in the paragraph's text color
+    CHARFORMAT2W cf = {}; cf.cbSize = sizeof(cf);
+    cf.dwMask      = CFM_COLOR;
+    cf.dwEffects   = 0;
+    cf.crTextColor = p.color;
+    SendMessageW(hEdit, EM_SETCHARFORMAT, SCF_SELECTION, (LPARAM)&cf);
+}
+
+static NeHRuleProps Ne_ReadHRuleProps(HWND hEdit)
+{
+    PARAFORMAT2 pf = {}; pf.cbSize = sizeof(pf);
+    pf.dwMask = PFM_BORDER | PFM_SPACEBEFORE | PFM_SPACEAFTER
+              | PFM_STARTINDENT | PFM_RIGHTINDENT | PFM_ALIGNMENT;
+    SendMessageW(hEdit, EM_GETPARAFORMAT, 0, (LPARAM)&pf);
+    CHARFORMAT2W cf = {}; cf.cbSize = sizeof(cf);
+    cf.dwMask = CFM_COLOR;
+    SendMessageW(hEdit, EM_GETCHARFORMAT, SCF_SELECTION, (LPARAM)&cf);
+    NeHRuleProps p = {};
+    // style in bits 8-11
+    int style = (pf.wBorders >> 8) & 0x0F;
+    p.styleIdx    = (style > 0) ? std::min(style - 1, 5) : 0;
+    p.thickness   = pf.wBorderWidth > 0 ? std::max(1, (int)(pf.wBorderWidth / 20)) : 1;
+    p.spaceBefore = pf.dySpaceBefore > 0 ? (int)pf.dySpaceBefore : 60;
+    p.spaceAfter  = pf.dySpaceAfter  > 0 ? (int)pf.dySpaceAfter  : 60;
+    p.color       = (cf.dwEffects & CFE_AUTOCOLOR) ? RGB(128,128,128) : cf.crTextColor;
+    // Reconstruct widthPct and align from indents
+    RECT fmtRc = {};
+    SendMessageW(hEdit, EM_GETRECT, 0, (LPARAM)&fmtRc);
+    int pixW = fmtRc.right - fmtRc.left;
+    HDC hdc  = GetDC(hEdit);
+    int dpiX = GetDeviceCaps(hdc, LOGPIXELSX);
+    ReleaseDC(hEdit, hdc);
+    int twipW  = (dpiX > 0) ? MulDiv(pixW, 1440, dpiX) : 8640;
+    int narrow = (int)pf.dxStartIndent + (int)pf.dxRightIndent;
+    p.widthPct = (twipW > 0) ? std::max(10, 100 - MulDiv(narrow, 100, twipW)) : 100;
+    if      (pf.wAlignment == PFA_RIGHT)  p.align = 2;
+    else if (pf.wAlignment == PFA_CENTER) p.align = 1;
+    else                                  p.align = 0;
+    return p;
+}
+
+static bool Ne_ShowHRulePropsDialog(HWND parent, HWND hEdit, bool insertMode, NeHRuleProps* inout)
+{
+    HINSTANCE hi = GetModuleHandleW(NULL);
+    static bool registered = false;
+    if (!registered) {
+        WNDCLASSW wc = {};
+        wc.lpfnWndProc   = Ne_HRulePropsDlgProc;
+        wc.hInstance     = hi;
+        wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+        wc.lpszClassName = L"NsbHRulePropsClass";
+        RegisterClassW(&wc);
+        registered = true;
+    }
+
+    const int P = S(10), EB = S(22), LH = S(22), CB = S(34);
+    const int LW = S(160), VX = S(170), VW = S(120);
+    int rowH    = LH + S(4) + EB + S(8);
+    int clientH = P;
+    clientH += rowH;                     // style
+    clientH += rowH;                     // thickness
+    clientH += rowH;                     // space above
+    clientH += rowH;                     // space below
+    clientH += rowH;                     // width
+    clientH += rowH;                     // alignment
+    clientH += LH + S(4) + EB + S(12);  // color
+    clientH += CB + P;                   // buttons
+    int clientW = std::max(S(390), VX + 3 * S(70) + S(20));
+
+    RECT wr = { 0, 0, clientW, clientH };
+    AdjustWindowRectEx(&wr, WS_POPUP | WS_CAPTION | WS_SYSMENU, FALSE, WS_EX_DLGMODALFRAME | WS_EX_WINDOWEDGE);
+    int W = wr.right - wr.left, H = wr.bottom - wr.top;
+    RECT pr = {}; if (parent) GetWindowRect(parent, &pr);
+    int x = (pr.left + pr.right) / 2 - W / 2, y = (pr.top + pr.bottom) / 2 - H / 2;
+    if (y < 30) y = 30;
+
+    const wchar_t* title = insertMode ? L"Insert Horizontal Rule" : L"Horizontal Rule Properties";
+    HWND dlg = CreateWindowExW(WS_EX_DLGMODALFRAME | WS_EX_WINDOWEDGE,
+        L"NsbHRulePropsClass", title,
+        WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
+        x, y, W, H, parent, NULL, hi, NULL);
+    if (!dlg) return false;
+
+    HFONT hf = Ne_MakeDlgFont(dlg);
+    RECT rc; GetClientRect(dlg, &rc);
+    int y0 = P;
+
+    auto mkLbl = [&](const wchar_t* t, int yy) {
+        HWND h = CreateWindowExW(0, L"STATIC", t, WS_CHILD | WS_VISIBLE,
+            P, yy + S(3), LW, LH, dlg, NULL, hi, NULL);
+        if (hf) SendMessageW(h, WM_SETFONT, (WPARAM)hf, TRUE);
+    };
+    auto mkSpin = [&](int id, int yy, int initVal, int lo, int hi_) -> HWND {
+        HWND hEd = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+            WS_CHILD | WS_VISIBLE | ES_NUMBER | ES_CENTER,
+            VX, yy, S(70), EB, dlg, (HMENU)(UINT_PTR)id, hi, NULL);
+        if (hf) SendMessageW(hEd, WM_SETFONT, (WPARAM)hf, TRUE);
+        wchar_t buf[16]; swprintf_s(buf, L"%d", initVal);
+        SetWindowTextW(hEd, buf);
+        HWND hSp = CreateWindowExW(0, UPDOWN_CLASSW, NULL,
+            WS_CHILD | WS_VISIBLE | UDS_ALIGNRIGHT | UDS_SETBUDDYINT | UDS_ARROWKEYS,
+            0, 0, 0, 0, dlg, NULL, hi, NULL);
+        SendMessageW(hSp, UDM_SETBUDDY,   (WPARAM)hEd, 0);
+        SendMessageW(hSp, UDM_SETRANGE32, lo, hi_);
+        SendMessageW(hSp, UDM_SETPOS32,   0, initVal);
+        return hEd;
+    };
+
+    // Style
+    mkLbl(L"Style:", y0); y0 += LH + S(4);
+    HWND hStyleCtrl = CreateWindowExW(WS_EX_CLIENTEDGE, L"COMBOBOX", L"",
+        WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL,
+        VX, y0, VW, EB * 8, dlg, (HMENU)(UINT_PTR)IDC_HRP_STYLE, hi, NULL);
+    if (hf) SendMessageW(hStyleCtrl, WM_SETFONT, (WPARAM)hf, TRUE);
+    for (int i = 0; i < 6; i++)
+        SendMessageW(hStyleCtrl, CB_ADDSTRING, 0, (LPARAM)s_hrStyleName[i]);
+    SendMessageW(hStyleCtrl, CB_SETCURSEL, inout->styleIdx, 0);
+    y0 += EB + S(8);
+
+    // Thickness
+    mkLbl(L"Thickness (pt):", y0); y0 += LH + S(4);
+    HWND hThickCtrl = mkSpin(IDC_HRP_THICKNESS, y0, inout->thickness, 1, 20);
+    (void)hThickCtrl;
+    y0 += EB + S(8);
+
+    // Space above
+    mkLbl(L"Space above (pt):", y0); y0 += LH + S(4);
+    HWND hAboveCtrl = mkSpin(IDC_HRP_SPACE_ABOVE, y0, inout->spaceBefore / 20, 0, 100);
+    (void)hAboveCtrl;
+    y0 += EB + S(8);
+
+    // Space below
+    mkLbl(L"Space below (pt):", y0); y0 += LH + S(4);
+    HWND hBelowCtrl = mkSpin(IDC_HRP_SPACE_BELOW, y0, inout->spaceAfter / 20, 0, 100);
+    (void)hBelowCtrl;
+    y0 += EB + S(8);
+
+    // Width
+    mkLbl(L"Width (%):", y0); y0 += LH + S(4);
+    HWND hWidthCtrl = mkSpin(IDC_HRP_WIDTH, y0, inout->widthPct, 10, 100);
+    (void)hWidthCtrl;
+    y0 += EB + S(8);
+
+    // Alignment
+    mkLbl(L"Alignment:", y0); y0 += LH + S(4);
+    {
+        const wchar_t* aTxt[3] = { L"Left", L"Center", L"Right" };
+        int aIds[3] = { IDC_HRP_ALIGN_L, IDC_HRP_ALIGN_C, IDC_HRP_ALIGN_R };
+        int aW = S(70);
+        for (int i = 0; i < 3; i++) {
+            DWORD sty = WS_CHILD | WS_VISIBLE | BS_AUTORADIOBUTTON;
+            if (i == 0) sty |= WS_GROUP;
+            HWND hr = CreateWindowExW(0, L"BUTTON", aTxt[i], sty,
+                VX + i * aW, y0, aW, EB, dlg, (HMENU)(UINT_PTR)aIds[i], hi, NULL);
+            if (hf) SendMessageW(hr, WM_SETFONT, (WPARAM)hf, TRUE);
+            if (i == inout->align) SendMessageW(hr, BM_SETCHECK, BST_CHECKED, 0);
+        }
+    }
+    y0 += EB + S(8);
+
+    // Color
+    mkLbl(L"Color:", y0); y0 += LH + S(4);
+    // Swatch — painted via WM_CTLCOLORSTATIC
+    HWND hSwatch = CreateWindowExW(WS_EX_STATICEDGE, L"STATIC", L"",
+        WS_CHILD | WS_VISIBLE,
+        VX, y0, S(36), EB, dlg, (HMENU)(UINT_PTR)IDC_HRP_SWATCH, hi, NULL);
+    SetWindowLongPtrW(hSwatch, GWLP_USERDATA, (LONG_PTR)(DWORD_PTR)inout->color);
+    // "Choose…" button opens ChooseColorW
+    HWND hChooseBtn = CreateWindowExW(0, L"BUTTON", L"Choose\u2026",
+        WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+        VX + S(44), y0, S(90), EB, dlg, (HMENU)(UINT_PTR)IDC_HRP_COLOR, hi, NULL);
+    if (hf) SendMessageW(hChooseBtn, WM_SETFONT, (WPARAM)hf, TRUE);
+    y0 += EB + S(12);
+
+    // Apply / Cancel buttons
+    s_hrPropsDD = {};
+    s_hrPropsDD.buttonCount = 2;
+    s_hrPropsDD.buttons[0] = { IDOK,     Ls(L"BTN_APPLY"),  NeBtnTone::Blue, IDI_INFORMATION, Ne_MeasureButtonWidth(Ls(L"BTN_APPLY"))  };
+    s_hrPropsDD.buttons[1] = { IDCANCEL, Ls(L"BTN_CANCEL"), NeBtnTone::Red,  IDI_ERROR,       Ne_MeasureButtonWidth(Ls(L"BTN_CANCEL")) };
+    {
+        int totalBtnW = 0;
+        for (int i = 0; i < s_hrPropsDD.buttonCount; i++) {
+            totalBtnW += s_hrPropsDD.buttons[i].width;
+            if (i + 1 < s_hrPropsDD.buttonCount) totalBtnW += S(6);
+        }
+        int bx = (rc.right - totalBtnW) / 2;
+        for (int i = 0; i < s_hrPropsDD.buttonCount; i++) {
+            auto& b = s_hrPropsDD.buttons[i];
+            DWORD sty = WS_CHILD | WS_VISIBLE | BS_OWNERDRAW;
+            if (b.id == IDOK) sty |= BS_DEFPUSHBUTTON;
+            HWND hBtn = CreateWindowExW(0, L"BUTTON", b.text.c_str(), sty,
+                bx, y0, b.width, CB, dlg, (HMENU)(UINT_PTR)b.id, hi, NULL);
+            if (hBtn) {
+                WNDPROC prev = (WNDPROC)SetWindowLongPtrW(hBtn, GWLP_WNDPROC, (LONG_PTR)Ne_BtnHoverProc);
+                SetPropW(hBtn, L"NePrevProc", (HANDLE)prev);
+            }
+            bx += b.width + S(6);
+        }
+    }
+
+    if (parent) EnableWindow(parent, FALSE);
+    SetFocus(hStyleCtrl);
+
+    MSG m;
+    s_hrPropsDD.result = IDCANCEL;
+    while (IsWindow(dlg) && GetMessageW(&m, NULL, 0, 0)) {
+        if (m.message == WM_KEYDOWN && m.wParam == VK_ESCAPE) { DestroyWindow(dlg); break; }
+        if (!IsDialogMessageW(dlg, &m)) { TranslateMessage(&m); DispatchMessageW(&m); }
+    }
+    bool ok = (s_hrPropsDD.result == IDOK);
+    if (s_hrSwatchBrush) { DeleteObject(s_hrSwatchBrush); s_hrSwatchBrush = NULL; }
+    if (parent) { EnableWindow(parent, TRUE); SetForegroundWindow(parent); }
+    if (ok) *inout = s_hrPropsResult;
+    return ok;
+}
+
+// ── Ne_InsertHRule / Ne_EditHRuleProps (forward-declared near Ne_CaretOnHRule) ─
+static void Ne_InsertHRule(HWND hwnd, HWND hEdit)
+{
+    NeHRuleProps p = { 0, 1, 60, 60, RGB(128,128,128), 100, 1 };  // defaults: single, 1pt, spacing, gray, full width, center
+    if (!Ne_ShowHRulePropsDialog(hwnd, hEdit, true, &p)) return;
+
+    // Collapse to end of current line
+    CHARRANGE cr = {};
+    SendMessageW(hEdit, EM_EXGETSEL, 0, (LPARAM)&cr);
+    LONG line = (LONG)SendMessageW(hEdit, EM_LINEFROMCHAR, cr.cpMax, 0);
+    LONG len  = (LONG)SendMessageW(hEdit, EM_LINELENGTH,   cr.cpMax, 0);
+    LONG idx  = (LONG)SendMessageW(hEdit, EM_LINEINDEX,    line, 0);
+    cr.cpMin = cr.cpMax = idx + len;
+    SendMessageW(hEdit, EM_EXSETSEL, 0, (LPARAM)&cr);
+
+    // Insert the rule paragraph
+    SendMessageW(hEdit, EM_REPLACESEL, TRUE, (LPARAM)L"\r");
+    Ne_ApplyHRuleProps(hEdit, p);
+
+    // Move to a clean follow-up paragraph, stripping border inheritance
+    SendMessageW(hEdit, EM_REPLACESEL, TRUE, (LPARAM)L"\r");
+    PARAFORMAT2 pfClean = {}; pfClean.cbSize = sizeof(pfClean);
+    pfClean.dwMask        = PFM_BORDER | PFM_STYLE | PFM_SPACEBEFORE | PFM_SPACEAFTER
+                          | PFM_STARTINDENT | PFM_RIGHTINDENT | PFM_ALIGNMENT;
+    pfClean.wBorders      = 0;
+    pfClean.sStyle        = 0;   // clear inherited HR marker
+    pfClean.dySpaceBefore = 0;
+    pfClean.dySpaceAfter  = 0;
+    pfClean.dxStartIndent = 0;
+    pfClean.dxRightIndent = 0;
+    pfClean.wAlignment    = PFA_LEFT;
+    SendMessageW(hEdit, EM_SETPARAFORMAT, 0, (LPARAM)&pfClean);
+    Ne_RebuildHRList(hEdit);
+    InvalidateRect(hEdit, NULL, FALSE);
+}
+
+static void Ne_EditHRuleProps(HWND hwnd, HWND hEdit)
+{
+    NeHRuleProps p = Ne_ReadHRuleProps(hEdit);
+    if (!Ne_ShowHRulePropsDialog(hwnd, hEdit, false, &p)) return;
+    Ne_ApplyHRuleProps(hEdit, p);
+    Ne_RebuildHRList(hEdit);
+    InvalidateRect(hEdit, NULL, FALSE);
+}
+
+// ── Line Spacing dialog ───────────────────────────────────────────────────────
+static void Ne_ShowLineSpaceDialog(HWND parent, HWND hEdit)
+{
+    HINSTANCE hi = GetModuleHandleW(NULL);
+
+    WNDCLASSW wc = {};
+    wc.lpfnWndProc   = DefWindowProcW;
+    wc.hInstance     = hi;
+    wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+    wc.lpszClassName = L"NsbLineSpClass";
+    if (!GetClassInfoW(hi, wc.lpszClassName, &wc)) RegisterClassW(&wc);
+
+    const int W = S(260), H = S(165);
+    RECT pr = {}; if (parent) GetWindowRect(parent, &pr);
+    int x = (pr.left+pr.right)/2-W/2, y = (pr.top+pr.bottom)/2-H/2;
+    if (y < 30) y = 30;
+
+    HWND dlg = CreateWindowExW(WS_EX_DLGMODALFRAME|WS_EX_WINDOWEDGE,
+        L"NsbLineSpClass", Ls(L"DLG_LINESPACE"),
+        WS_POPUP|WS_CAPTION|WS_SYSMENU|WS_VISIBLE,
+        x, y, W, H, parent, NULL, hi, NULL);
+    if (!dlg) return;
+
+    HFONT hf = Ne_MakeDlgFont(dlg);
+    RECT rc; GetClientRect(dlg, &rc);
+    const int P = S(10), LH = S(24), CB = S(26);
+    int y0 = P;
+
+    // Determine current spacing to pre-check the right radio.
+    PARAFORMAT2 pf = {}; pf.cbSize = sizeof(pf);
+    pf.dwMask = PFM_LINESPACING;
+    SendMessageW(hEdit, EM_GETPARAFORMAT, 0, (LPARAM)&pf);
+    // PFM_LINESPACING: bLineSpacingRule 0=single,1=1.5,2=double,3=multiple,4=exact,5=at-least
+    int curRule = pf.bLineSpacingRule; // 0=single,1=1.5×,2=double
+
+    auto mkRdo = [&](int id, const wchar_t* t, bool chk) {
+        HWND h = CreateWindowExW(0,L"BUTTON",t,
+            WS_CHILD|WS_VISIBLE|BS_AUTORADIOBUTTON|(y0==P ? WS_GROUP : 0),
+            P, y0, rc.right-2*P, LH, dlg,(HMENU)(UINT_PTR)id,hi,NULL);
+        if(hf) SendMessageW(h,WM_SETFONT,(WPARAM)hf,TRUE);
+        if(chk) SendMessageW(h,BM_SETCHECK,BST_CHECKED,0);
+        y0 += LH + S(4);
+    };
+    mkRdo(1001, Ls(L"RDO_LINESPACE_S"),  curRule == 0);
+    mkRdo(1002, Ls(L"RDO_LINESPACE_15"), curRule == 1);
+    mkRdo(1003, Ls(L"RDO_LINESPACE_D"),  curRule == 2);
+    y0 += P;
+
+    int bw = S(80);
+    int bx = rc.right - P - bw;
+    auto mkBtnL = [&](int id, const wchar_t* t, int xx, bool def_) {
+        DWORD sty = WS_CHILD|WS_VISIBLE|(def_?BS_DEFPUSHBUTTON:BS_PUSHBUTTON);
+        HWND h = CreateWindowExW(0,L"BUTTON",t,sty, xx,y0,bw,CB, dlg,(HMENU)(UINT_PTR)id,hi,NULL);
+        if(hf) SendMessageW(h,WM_SETFONT,(WPARAM)hf,TRUE);
+    };
+    mkBtnL(IDCANCEL, Ls(L"BTN_CANCEL"), bx, false); bx -= bw + S(6);
+    mkBtnL(IDOK,     Ls(L"BTN_SAVE"),   bx, true);
+
+    if (parent) EnableWindow(parent, FALSE);
+
+    MSG m; bool ok = false;
+    while (IsWindow(dlg) && GetMessageW(&m, NULL, 0, 0)) {
+        if (m.message == WM_KEYDOWN && m.wParam == VK_ESCAPE) { DestroyWindow(dlg); break; }
+        if (!IsDialogMessageW(dlg, &m)) { TranslateMessage(&m); DispatchMessageW(&m); }
+        if (!IsWindow(dlg)) break;
+        if (m.message == WM_COMMAND && LOWORD(m.wParam) == IDOK && m.hwnd == dlg) { ok = true; break; }
+    }
+    if (parent) { EnableWindow(parent, TRUE); SetForegroundWindow(parent); }
+
+    if (ok && IsWindow(dlg)) {
+        int rule = 0;
+        if (SendMessageW(GetDlgItem(dlg, 1002), BM_GETCHECK, 0, 0) == BST_CHECKED) rule = 1;
+        if (SendMessageW(GetDlgItem(dlg, 1003), BM_GETCHECK, 0, 0) == BST_CHECKED) rule = 2;
+        DestroyWindow(dlg);
+        PARAFORMAT2 pf2 = {}; pf2.cbSize = sizeof(pf2);
+        pf2.dwMask           = PFM_LINESPACING;
+        pf2.bLineSpacingRule = (BYTE)rule;
+        pf2.dyLineSpacing    = 0; // 0 = auto for rules 0,1,2
+        SendMessageW(hEdit, EM_SETPARAFORMAT, 0, (LPARAM)&pf2);
+    } else if (IsWindow(dlg)) {
+        DestroyWindow(dlg);
+    }
+    SetFocus(hEdit);
+}
+
+// ── Paragraph Spacing dialog ──────────────────────────────────────────────────
+static void Ne_ShowParSpaceDialog(HWND parent, HWND hEdit)
+{
+    HINSTANCE hi = GetModuleHandleW(NULL);
+
+    WNDCLASSW wc = {};
+    wc.lpfnWndProc   = DefWindowProcW;
+    wc.hInstance     = hi;
+    wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+    wc.lpszClassName = L"NsbParSpClass";
+    if (!GetClassInfoW(hi, wc.lpszClassName, &wc)) RegisterClassW(&wc);
+
+    const int W = S(300), H = S(155);
+    RECT pr = {}; if (parent) GetWindowRect(parent, &pr);
+    int x = (pr.left+pr.right)/2-W/2, y = (pr.top+pr.bottom)/2-H/2;
+    if (y < 30) y = 30;
+
+    HWND dlg = CreateWindowExW(WS_EX_DLGMODALFRAME|WS_EX_WINDOWEDGE,
+        L"NsbParSpClass", Ls(L"DLG_PARSPACE"),
+        WS_POPUP|WS_CAPTION|WS_SYSMENU|WS_VISIBLE,
+        x, y, W, H, parent, NULL, hi, NULL);
+    if (!dlg) return;
+
+    HFONT hf = Ne_MakeDlgFont(dlg);
+    RECT rc; GetClientRect(dlg, &rc);
+    const int P = S(10), EB = S(22), LH = S(24), CB = S(26);
+    int y0 = P;
+
+    // Read current values (in twips; 1pt = 20 twips).
+    PARAFORMAT2 pf = {}; pf.cbSize = sizeof(pf);
+    pf.dwMask = PFM_SPACEBEFORE | PFM_SPACEAFTER;
+    SendMessageW(hEdit, EM_GETPARAFORMAT, 0, (LPARAM)&pf);
+    int befPt = pf.dySpaceBefore / 20, aftPt = pf.dySpaceAfter / 20;
+
+    auto mkLbl = [&](const wchar_t* t, int xx, int yy) {
+        HWND h = CreateWindowExW(0,L"STATIC",t,WS_CHILD|WS_VISIBLE, xx,yy+S(3),S(130),LH,dlg,NULL,hi,NULL);
+        if(hf) SendMessageW(h,WM_SETFONT,(WPARAM)hf,TRUE);
+    };
+    auto mkSpinP = [&](int id, int xx, int yy, int init) -> HWND {
+        HWND hEd = CreateWindowExW(WS_EX_CLIENTEDGE,L"EDIT",L"",
+            WS_CHILD|WS_VISIBLE|ES_NUMBER|ES_CENTER,
+            xx,yy,S(50),EB, dlg,(HMENU)(UINT_PTR)id,hi,NULL);
+        if(hf) SendMessageW(hEd,WM_SETFONT,(WPARAM)hf,TRUE);
+        wchar_t buf[8]; swprintf_s(buf,L"%d",init); SetWindowTextW(hEd,buf);
+        HWND hSp = CreateWindowExW(0,UPDOWN_CLASSW,NULL,
+            WS_CHILD|WS_VISIBLE|UDS_ALIGNRIGHT|UDS_SETBUDDYINT|UDS_ARROWKEYS,
+            0,0,0,0, dlg,NULL,hi,NULL);
+        SendMessageW(hSp,UDM_SETBUDDY,(WPARAM)hEd,0);
+        SendMessageW(hSp,UDM_SETRANGE32,0,200);
+        SendMessageW(hSp,UDM_SETPOS32,0,init);
+        return hEd;
+    };
+
+    mkLbl(Ls(L"DLG_PARSPACE_BEF"), P, y0);
+    HWND hBef = mkSpinP(IDC_NE_DLG_PAR_BEF, P+S(140), y0, befPt); y0 += EB + P;
+    mkLbl(Ls(L"DLG_PARSPACE_AFT"), P, y0);
+    HWND hAft = mkSpinP(IDC_NE_DLG_PAR_AFT, P+S(140), y0, aftPt); y0 += EB + P*2;
+
+    int bw = S(80);
+    int bx = rc.right - P - bw;
+    auto mkBtnP = [&](int id, const wchar_t* t, int xx, bool def_) {
+        DWORD sty = WS_CHILD|WS_VISIBLE|(def_?BS_DEFPUSHBUTTON:BS_PUSHBUTTON);
+        HWND h = CreateWindowExW(0,L"BUTTON",t,sty, xx,y0,bw,CB, dlg,(HMENU)(UINT_PTR)id,hi,NULL);
+        if(hf) SendMessageW(h,WM_SETFONT,(WPARAM)hf,TRUE);
+    };
+    mkBtnP(IDCANCEL, Ls(L"BTN_CANCEL"), bx, false); bx -= bw + S(6);
+    mkBtnP(IDOK,     Ls(L"BTN_SAVE"),   bx, true);
+
+    if (parent) EnableWindow(parent, FALSE);
+    SetFocus(hBef);
+
+    MSG m; bool ok = false;
+    while (IsWindow(dlg) && GetMessageW(&m, NULL, 0, 0)) {
+        if (m.message == WM_KEYDOWN && m.wParam == VK_ESCAPE) { DestroyWindow(dlg); break; }
+        if (!IsDialogMessageW(dlg, &m)) { TranslateMessage(&m); DispatchMessageW(&m); }
+        if (!IsWindow(dlg)) break;
+        if (m.message == WM_COMMAND && LOWORD(m.wParam) == IDOK && m.hwnd == dlg) { ok = true; break; }
+    }
+    if (parent) { EnableWindow(parent, TRUE); SetForegroundWindow(parent); }
+
+    if (ok && IsWindow(dlg)) {
+        wchar_t bb[8]={}, ab[8]={};
+        GetWindowTextW(hBef, bb, 8); GetWindowTextW(hAft, ab, 8);
+        DestroyWindow(dlg);
+        PARAFORMAT2 pf2 = {}; pf2.cbSize = sizeof(pf2);
+        pf2.dwMask        = PFM_SPACEBEFORE | PFM_SPACEAFTER;
+        pf2.dySpaceBefore = (LONG)(_wtoi(bb) * 20);
+        pf2.dySpaceAfter  = (LONG)(_wtoi(ab) * 20);
+        SendMessageW(hEdit, EM_SETPARAFORMAT, 0, (LPARAM)&pf2);
+    } else if (IsWindow(dlg)) {
+        DestroyWindow(dlg);
+    }
+    SetFocus(hEdit);
+}
+
 static void Ne_ShowShortcuts(HWND parent)
 {
     // Simple modal dialog: title bar, a ListView, and a Close button.
@@ -1247,6 +3327,337 @@ static bool Ne_IsRtf(const std::string& bytes)
     return bytes.size() >= 5 && bytes.compare(0, 5, "{\\rtf") == 0;
 }
 
+// ── Encoding helpers ──────────────────────────────────────────────────────────
+
+// True when the active doc's path has a .rtf extension.
+static bool Ne_DocIsRtf(NeTabDoc* doc)
+{
+    if (!doc || doc->path.empty()) return false;
+    size_t dot = doc->path.rfind(L'.');
+    if (dot == std::wstring::npos) return false;
+    std::wstring ext = doc->path.substr(dot + 1);
+    for (auto& c : ext) c = (wchar_t)towlower(c);
+    return ext == L"rtf";
+}
+
+// Return the status-bar label for a given NeEncoding.
+static const wchar_t* Ne_EncLabel(NeEncoding enc)
+{
+    switch (enc) {
+    case NeEncoding::RichText:  return Ls(L"ENC_RICHTEXT");
+    case NeEncoding::UTF8:      return Ls(L"ENC_UTF8");
+    case NeEncoding::UTF16LE:   return Ls(L"ENC_UTF16LE");
+    case NeEncoding::ANSI:      return Ls(L"ENC_ANSI");
+    case NeEncoding::Win1252:   return Ls(L"ENC_WIN1252");
+    case NeEncoding::ISO8859_1: return Ls(L"ENC_ISO8859_1");
+    default:                    return Ls(L"ENC_UNKNOWN");
+    }
+}
+
+// Convert the UTF-16LE wide text from RichEdit back to a narrow encoding.
+// codepage 0 = CP_ACP (ANSI), 1252 = Windows-1252, 28591 = ISO-8859-1.
+static std::string Ne_WideToCodepage(const std::wstring& wide, UINT cp)
+{
+    int n = WideCharToMultiByte(cp, 0, wide.c_str(), (int)wide.size(), NULL, 0, "?", NULL);
+    std::string out(n, '\0');
+    WideCharToMultiByte(cp, 0, wide.c_str(), (int)wide.size(), out.data(), n, "?", NULL);
+    return out;
+}
+
+// Detect encoding from raw file bytes. Sets doc->encoding.
+static void Ne_DetectEncoding(NeTabDoc* doc, const std::string& bytes)
+{
+    if (!doc) return;
+    if (Ne_IsRtf(bytes)) { doc->encoding = (int)NeEncoding::RichText; return; }
+    const unsigned char* p = (const unsigned char*)bytes.data();
+    size_t n = bytes.size();
+    if (n >= 2 && p[0] == 0xFF && p[1] == 0xFE) {
+        doc->encoding = (int)NeEncoding::UTF16LE; return;
+    }
+    if (n >= 3 && p[0] == 0xEF && p[1] == 0xBB && p[2] == 0xBF) {
+        doc->encoding = (int)NeEncoding::UTF8; return;
+    }
+    // Try strict UTF-8 decode.
+    size_t offset = 0;
+    int wlen = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+                                   bytes.data() + offset, (int)(n - offset), NULL, 0);
+    doc->encoding = (int)(wlen > 0 ? NeEncoding::UTF8 : NeEncoding::ANSI);
+}
+
+// ── Detect whether the document contains any non-plain formatting ─────────────
+static bool Ne_HasFormatting(HWND hEdit)
+{
+    // Save & restore selection so the user doesn't notice.
+    CHARRANGE crOld;
+    SendMessageW(hEdit, EM_EXGETSEL, 0, (LPARAM)&crOld);
+    SendMessageW(hEdit, EM_SETSEL, 0, -1);
+
+    // Character formatting common to the entire selection.
+    CHARFORMAT2W cf = {}; cf.cbSize = sizeof(cf);
+    SendMessageW(hEdit, EM_GETCHARFORMAT, SCF_SELECTION, (LPARAM)&cf);
+
+    // Paragraph formatting.
+    PARAFORMAT2 pf = {}; pf.cbSize = sizeof(pf);
+    SendMessageW(hEdit, EM_GETPARAFORMAT, 0, (LPARAM)&pf);
+
+    SendMessageW(hEdit, EM_EXSETSEL, 0, (LPARAM)&crOld);
+
+    // ── Character checks ──────────────────────────────────────────────────────
+    // If a CFM_ bit is CLEAR the property is mixed across the document → formatting.
+    const DWORD fmtBits = CFM_BOLD|CFM_ITALIC|CFM_UNDERLINE|CFM_STRIKEOUT|
+                          CFM_SUBSCRIPT|CFM_SUPERSCRIPT|CFM_COLOR|CFM_BACKCOLOR;
+    if ((cf.dwMask & fmtBits) != fmtBits) return true;         // mixed
+
+    // Uniform but active effects.
+    if (cf.dwEffects & (CFE_BOLD|CFE_ITALIC|CFE_UNDERLINE|CFE_STRIKEOUT|
+                        CFE_SUBSCRIPT|CFE_SUPERSCRIPT))         return true;
+
+    // Non-auto colour or background colour.
+    if (!(cf.dwEffects & CFE_AUTOCOLOR))                        return true;
+    if (!(cf.dwEffects & CFE_AUTOBACKCOLOR))                    return true;
+
+    // Mixed or non-default font size (240 half-pts = 12pt in RichEdit CHARFORMAT).
+    if (!(cf.dwMask & CFM_SIZE))                                return true;
+    if (cf.yHeight != 240)                                      return true;
+
+    // ── Paragraph checks ─────────────────────────────────────────────────────
+    if ((pf.dwMask & PFM_ALIGNMENT)   && pf.wAlignment != PFA_LEFT) return true;
+    if ((pf.dwMask & PFM_NUMBERING)   && pf.wNumbering != 0)        return true;
+    if ((pf.dwMask & PFM_OFFSET)      && pf.dxOffset != 0)          return true;
+    if ((pf.dwMask & PFM_STARTINDENT) && pf.dxStartIndent != 0)     return true;
+    if ((pf.dwMask & PFM_SPACEBEFORE) && pf.dySpaceBefore != 0)     return true;
+    if ((pf.dwMask & PFM_SPACEAFTER)  && pf.dySpaceAfter  != 0)     return true;
+
+    return false;
+}
+
+// ── HR metadata store ─────────────────────────────────────────────────────────
+// Paragraph scanning with EM_EXSETSEL must NOT happen inside WM_PAINT (triggers
+// re-entrant WM_PAINT via RichEdit internal redraws).  We scan once on EN_CHANGE
+// and cache results; WM_PAINT only calls EM_POSFROMCHAR (safe, no sel change).
+struct NeHRuleEntry {
+    LONG     charIdx;
+    COLORREF color;
+    int      thicknessTwips;   // pt * 20
+    int      leftIndentTwips;
+    int      rightIndentTwips;
+};
+static std::map<HWND, std::vector<NeHRuleEntry>> g_hrMap;
+
+// Rebuild HR list for hEdit.  Safe to call at any time except during WM_PAINT.
+static void Ne_RebuildHRList(HWND hEdit)
+{
+    auto& list = g_hrMap[hEdit];
+    list.clear();
+
+    int lineCount = (int)SendMessageW(hEdit, EM_GETLINECOUNT, 0, 0);
+    if (lineCount <= 0) return;
+
+    CHARRANGE crSave = {};
+    SendMessageW(hEdit, EM_EXGETSEL, 0, (LPARAM)&crSave);
+    DWORD oldMask = (DWORD)SendMessageW(hEdit, EM_GETEVENTMASK, 0, 0);
+    SendMessageW(hEdit, EM_SETEVENTMASK, 0, 0);
+
+    SendMessageW(hEdit, WM_SETREDRAW, FALSE, 0);  // suppress visual selection flicker during scan
+    for (int ln = 0; ln < lineCount; ln++) {
+        LONG idx = (LONG)SendMessageW(hEdit, EM_LINEINDEX, ln, 0);
+        if (idx < 0) break;
+        CHARRANGE cr = { idx, idx };
+        SendMessageW(hEdit, EM_EXSETSEL, 0, (LPARAM)&cr);
+
+        PARAFORMAT2 pf = {}; pf.cbSize = sizeof(pf);
+        pf.dwMask = PFM_BORDER | PFM_STYLE | PFM_STARTINDENT | PFM_RIGHTINDENT;
+        SendMessageW(hEdit, EM_GETPARAFORMAT, 0, (LPARAM)&pf);
+        // Detect by sStyle marker (most reliable) or legacy wBorders
+        if (pf.sStyle != 42 && !pf.wBorders) continue;
+
+        CHARFORMAT2W cf = {}; cf.cbSize = sizeof(cf);
+        cf.dwMask = CFM_COLOR;
+        SendMessageW(hEdit, EM_GETCHARFORMAT, SCF_SELECTION, (LPARAM)&cf);
+
+        NeHRuleEntry e;
+        e.charIdx          = idx;
+        e.color            = (cf.dwEffects & CFE_AUTOCOLOR) ? RGB(128,128,128) : cf.crTextColor;
+        e.thicknessTwips   = (int)pf.wBorderWidth;
+        e.leftIndentTwips  = (int)pf.dxStartIndent;
+        e.rightIndentTwips = (int)pf.dxRightIndent;
+        list.push_back(e);
+    }
+
+    SendMessageW(hEdit, EM_EXSETSEL,    0, (LPARAM)&crSave);
+    SendMessageW(hEdit, EM_SETEVENTMASK, 0, oldMask);
+    SendMessageW(hEdit, WM_SETREDRAW, TRUE, 0);
+}
+
+// Draw cached HR lines — NO selection changes here.
+static void Ne_PaintHRules(HWND hwnd, HDC hdc)
+{
+    auto it = g_hrMap.find(hwnd);
+    if (it == g_hrMap.end() || it->second.empty()) return;
+
+    RECT rcC;  GetClientRect(hwnd, &rcC);
+    RECT fmtRc = {}; SendMessageW(hwnd, EM_GETRECT, 0, (LPARAM)&fmtRc);
+    int dpiX = GetDeviceCaps(hdc, LOGPIXELSX);
+    int dpiY = GetDeviceCaps(hdc, LOGPIXELSY);
+
+    for (const auto& e : it->second) {
+        // Screen position — EM_POSFROMCHAR does NOT change the selection
+        POINTL ptLine = {};
+        SendMessageW(hwnd, EM_POSFROMCHAR, (WPARAM)&ptLine, (LPARAM)e.charIdx);
+        int lineY = ptLine.y;
+
+        // Line height
+        int lineH = S(20);
+        int curLn = (int)SendMessageW(hwnd, EM_LINEFROMCHAR, e.charIdx, 0);
+        LONG nextIdx = (LONG)SendMessageW(hwnd, EM_LINEINDEX, curLn + 1, 0);
+        if (nextIdx > e.charIdx) {
+            POINTL ptNext = {};
+            SendMessageW(hwnd, EM_POSFROMCHAR, (WPARAM)&ptNext, (LPARAM)nextIdx);
+            if (ptNext.y > lineY) lineH = ptNext.y - lineY;
+        }
+
+        int leftPx  = fmtRc.left  + MulDiv(e.leftIndentTwips,  dpiX, 1440);
+        int rightPx = fmtRc.right - MulDiv(e.rightIndentTwips, dpiX, 1440);
+        int drawY   = lineY + lineH / 2;
+
+        int penPx = std::max(1, MulDiv(e.thicknessTwips, dpiY, 1440));
+        LOGBRUSH lb = { BS_SOLID, e.color, 0 };
+        HPEN hPen = ExtCreatePen(PS_GEOMETRIC | PS_SOLID | PS_ENDCAP_FLAT, penPx, &lb, 0, NULL);
+        if (!hPen) hPen = CreatePen(PS_SOLID, penPx, e.color);
+        HPEN hOld = (HPEN)SelectObject(hdc, hPen);
+        MoveToEx(hdc, leftPx,  drawY, NULL);
+        LineTo  (hdc, rightPx, drawY);
+        SelectObject(hdc, hOld);
+        DeleteObject(hPen);
+    }
+}
+
+// ── Hyperlink URL extraction from RTF field instruction ─────────────────────
+// RichEdit HYPERLINK fields store the URL in hidden \fldinst text.
+// EM_GETTEXTRANGE gives display text only; we must stream out RTF and parse.
+static std::wstring Ne_ParseHyperlinkFromRtf(const std::string& rtf)
+{
+    size_t pos = rtf.find("HYPERLINK");
+    if (pos == std::string::npos) return {};
+    pos += 9;
+    while (pos < rtf.size() && rtf[pos] == ' ') pos++;
+    if (pos >= rtf.size() || rtf[pos] != '"') return {};
+    ++pos;
+    size_t end = rtf.find('"', pos);
+    if (end == std::string::npos) return {};
+    std::string urlA = rtf.substr(pos, end - pos);
+    int n = MultiByteToWideChar(CP_ACP, 0, urlA.c_str(), (int)urlA.size(), NULL, 0);
+    if (n <= 0) return {};
+    std::wstring url(n, L'\0');
+    MultiByteToWideChar(CP_ACP, 0, urlA.c_str(), (int)urlA.size(), &url[0], n);
+    return url;
+}
+
+// Extract hyperlink URL at charIdx by streaming out the surrounding RTF.
+// The field instruction (hidden text) precedes the visible display text;
+// going back 512 chars is enough to capture any realistic URL.
+static std::wstring Ne_ExtractLinkUrlAt(HWND hEdit, LONG charIdx)
+{
+    CHARRANGE crSav = {};
+    SendMessageW(hEdit, EM_EXGETSEL, 0, (LPARAM)&crSav);
+
+    int docLen = GetWindowTextLengthW(hEdit);
+    LONG cpMin = std::max(0L, charIdx - 512);
+    LONG cpMax = std::min((LONG)docLen, charIdx + 1);
+    CHARRANGE cr = { cpMin, cpMax };
+    SendMessageW(hEdit, EM_EXSETSEL, 0, (LPARAM)&cr);
+
+    std::string rtf;
+    EDITSTREAM es = { (DWORD_PTR)&rtf, 0, Ne_WriteCb };
+    SendMessageW(hEdit, EM_STREAMOUT, SF_RTF | SFF_SELECTION, (LPARAM)&es);
+    SendMessageW(hEdit, EM_EXSETSEL, 0, (LPARAM)&crSav);
+
+    return Ne_ParseHyperlinkFromRtf(rtf);
+}
+
+// ── Thick-caret subclass for main editor RichEdit(s) ──────────────────────
+static LRESULT CALLBACK Ne_EditCaretProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+    WNDPROC prev = (WNDPROC)GetPropW(hwnd, L"NeEditCaretPrev");
+    if (msg == WM_SETFOCUS) {
+        LRESULT r = CallWindowProcW(prev, hwnd, msg, wParam, lParam);
+        // Recreate the caret with a visible 2-pixel width, matching the editor font height.
+        TEXTMETRICW tm = {};
+        HDC hdc = GetDC(hwnd);
+        HFONT hf = (HFONT)SendMessageW(hwnd, WM_GETFONT, 0, 0);
+        HFONT hfOld = hf ? (HFONT)SelectObject(hdc, hf) : NULL;
+        GetTextMetricsW(hdc, &tm);
+        if (hfOld) SelectObject(hdc, hfOld);
+        ReleaseDC(hwnd, hdc);
+        DestroyCaret();
+        CreateCaret(hwnd, NULL, S(2), tm.tmHeight);
+        ShowCaret(hwnd);
+        return r;
+    }
+    if (msg == WM_MOUSEMOVE) {
+        // Call through first so RichEdit sets its cursor (IDC_HAND over links).
+        LRESULT r = CallWindowProcW(prev, hwnd, msg, wParam, lParam);
+        static HCURSOR s_hHand = LoadCursor(NULL, IDC_HAND);
+        static bool s_wasLink  = false;
+        bool isLink = (GetCursor() == s_hHand);
+        if (isLink && !s_wasLink) {
+            // Cursor just entered a link — extract URL and show two-line tooltip.
+            POINT ptClient = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+            LRESULT idx = SendMessageW(hwnd, EM_CHARFROMPOS, 0, (LPARAM)&ptClient);
+            std::wstring url = Ne_ExtractLinkUrlAt(hwnd, (LONG)idx);
+            POINT ptScreen; GetCursorPos(&ptScreen);
+            std::vector<TooltipEntry> tips = {
+                { L"", url.empty() ? std::wstring(L"") : url },
+                { L"", Ls(L"LINK_TIP_CTRL") }
+            };
+            ShowMultilingualTooltip(tips, ptScreen.x, ptScreen.y + S(20), GetParent(hwnd));
+        } else if (!isLink && IsTooltipVisible()) {
+            HideTooltip();
+        }
+        s_wasLink = isLink;
+        return r;
+    }
+    if (msg == WM_MOUSELEAVE) {
+        HideTooltip();
+    }
+    if (msg == WM_LBUTTONDOWN && (GetKeyState(VK_CONTROL) & 0x8000)) {
+        // Ctrl+Click on a hyperlink — extract URL and open in browser.
+        static HCURSOR s_hHandC = LoadCursor(NULL, IDC_HAND);
+        if (GetCursor() == s_hHandC) {
+            POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+            LRESULT idx = SendMessageW(hwnd, EM_CHARFROMPOS, 0, (LPARAM)&pt);
+            std::wstring url = Ne_ExtractLinkUrlAt(hwnd, (LONG)idx);
+            if (!url.empty()) {
+                HideTooltip();
+                ShellExecuteW(NULL, L"open", url.c_str(), NULL, NULL, SW_SHOWNORMAL);
+                return 0;
+            }
+        }
+    }
+    if (msg == WM_PAINT) {
+        // Let RichEdit handle its full BeginPaint/EndPaint cycle first.
+        LRESULT r = CallWindowProcW(prev, hwnd, msg, wParam, lParam);
+        // Then overlay HR lines with a fresh DC (avoids nested-BeginPaint clip issues).
+        HDC hdc = GetDC(hwnd);
+        Ne_PaintHRules(hwnd, hdc);
+        ReleaseDC(hwnd, hdc);
+        return r;
+    }
+    if (msg == WM_NCDESTROY) {
+        g_hrMap.erase(hwnd);
+        RemovePropW(hwnd, L"NeEditCaretPrev");
+        SetWindowLongPtrW(hwnd, GWLP_WNDPROC, (LONG_PTR)prev);
+    }
+    return CallWindowProcW(prev, hwnd, msg, wParam, lParam);
+}
+
+static void Ne_SubclassEditForCaret(HWND hEdit)
+{
+    if (!hEdit || GetPropW(hEdit, L"NeEditCaretPrev")) return; // already subclassed
+    WNDPROC prev = (WNDPROC)SetWindowLongPtrW(hEdit, GWLP_WNDPROC, (LONG_PTR)Ne_EditCaretProc);
+    SetPropW(hEdit, L"NeEditCaretPrev", (HANDLE)prev);
+}
+
 static void Ne_New(HWND hwnd)
 {
     if (!NeTabs_AddUntitled(hwnd)) return;
@@ -1262,10 +3673,15 @@ static void Ne_New(HWND hwnd)
         wcsncpy_s(cfD.szFaceName, L"Segoe UI", LF_FACESIZE - 1);
         SendMessageW(hEdit, EM_SETCHARFORMAT, SCF_ALL, (LPARAM)&cfD);
         SendMessageW(hEdit, EM_SETBKGNDCOLOR, 0, RGB(255, 255, 255));
-        SendMessageW(hEdit, EM_SETEVENTMASK, 0, ENM_CHANGE | ENM_SELCHANGE);
+        SendMessageW(hEdit, EM_SETEVENTMASK, 0, ENM_CHANGE | ENM_SELCHANGE | ENM_LINK);
+        Ne_SubclassEditForCaret(hEdit);
+        SendMessageW(hEdit, EM_SETEVENTMASK, 0, ENM_SELCHANGE);  // suppress EN_CHANGE during attach
+        Ne_AttachScrollbars(hEdit);
+        SendMessageW(hEdit, EM_SETEVENTMASK, 0, ENM_CHANGE | ENM_SELCHANGE | ENM_LINK);
         SetFocus(hEdit);
     }
     NeTabs_UpdateTabTitle(hwnd, NeTabs_GetActiveIndex(hwnd));
+    Ne_SyncScrollbarVisibility(hwnd);
 }
 
 static bool Ne_LoadPathIntoEditor(HWND hwnd, const std::wstring& path)
@@ -1284,11 +3700,49 @@ static bool Ne_LoadPathIntoEditor(HWND hwnd, const std::wstring& path)
     NeTabDoc* doc = NeTabs_GetActiveDoc(hwnd);
     if (!hEdit || !doc) return false;
 
+    bool isRtf = Ne_IsRtf(bytes);
+    std::string streamBytes = bytes;
+
+    if (!isRtf) {
+        const unsigned char* p = (const unsigned char*)bytes.data();
+        size_t n = bytes.size();
+        std::wstring wide;
+
+        if (n >= 2 && p[0] == 0xFF && p[1] == 0xFE) {
+            // UTF-16LE BOM — already correct, pass through as-is.
+            streamBytes = bytes;
+        } else {
+            // Determine whether to decode as UTF-8 or ANSI.
+            size_t offset = (n >= 3 && p[0]==0xEF && p[1]==0xBB && p[2]==0xBF) ? 3 : 0;
+            int wlen = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+                                           bytes.data() + offset, (int)(n - offset),
+                                           NULL, 0);
+            if (wlen > 0) {
+                wide.resize(wlen);
+                MultiByteToWideChar(CP_UTF8, 0, bytes.data() + offset, (int)(n - offset),
+                                    wide.data(), wlen);
+            } else {
+                // Fallback: ANSI (system codepage).
+                wlen = MultiByteToWideChar(CP_ACP, 0, bytes.data(), (int)n, NULL, 0);
+                if (wlen > 0) {
+                    wide.resize(wlen);
+                    MultiByteToWideChar(CP_ACP, 0, bytes.data(), (int)n, wide.data(), wlen);
+                }
+            }
+            // Repack wide chars as raw bytes for SF_TEXT|SF_UNICODE.
+            streamBytes.assign(reinterpret_cast<const char*>(wide.data()),
+                               wide.size() * sizeof(wchar_t));
+        }
+    }
+
     doc->suppressChange = true;
-    Ne_StreamIn(hEdit, bytes, Ne_IsRtf(bytes));
+    Ne_StreamIn(hEdit, streamBytes, isRtf);
     doc->suppressChange = false;
+    Ne_RebuildHRList(hEdit);   // pick up any HR paragraphs in the loaded file
+    InvalidateRect(hEdit, NULL, FALSE);
     doc->path = path;
     doc->modified = false;
+    Ne_DetectEncoding(doc, bytes);   // sets doc->encoding from raw file bytes
     Ne_RememberDiskStamp(doc);
 
     NeTabs_UpdateTabTitle(hwnd, NeTabs_GetActiveIndex(hwnd));
@@ -1327,21 +3781,101 @@ static bool Ne_SaveToPath(HWND hwnd, const std::wstring& path)
     if (!hEdit) return false;
 
     bool asRtf = true;
-    size_t dot = path.rfind(L'.');
+    std::wstring savePath = path;
+    size_t dot = savePath.rfind(L'.');
     if (dot != std::wstring::npos) {
-        std::wstring ext = path.substr(dot + 1);
+        std::wstring ext = savePath.substr(dot + 1);
         for (auto& c : ext) c = (wchar_t)towlower(c);
-        if (ext == L"txt") asRtf = false;
+        if (ext == L"txt" || ext == L"md") asRtf = false;
+    }
+
+    // ── Formatting-in-plain-text guard ────────────────────────────────────────
+    if (!asRtf && Ne_HasFormatting(hEdit)) {
+        int r = MessageBoxW(hwnd, Ls(L"MSG_HAS_FORMATTING"), Ls(L"APP_NAME"),
+                            MB_YESNOCANCEL | MB_ICONWARNING);
+        if (r == IDCANCEL) return false;
+        if (r == IDNO) {
+            // Redirect to RTF: replace extension with .rtf.
+            savePath = (dot != std::wstring::npos ? savePath.substr(0, dot) : savePath) + L".rtf";
+            asRtf = true;
+            // Update the document's stored path so subsequent Ctrl+S goes to the .rtf.
+            NeTabDoc* doc = NeTabs_GetActiveDoc(hwnd);
+            if (doc) doc->path = savePath;
+        }
+        // IDYES → fall through and save as plain text, losing formatting.
     }
 
     std::string bytes = Ne_StreamOut(hEdit, asRtf);
+
+    // For plain text, Ne_StreamOut gives UTF-16LE bytes; convert to chosen encoding.
+    std::string writeBytes;
+    if (!asRtf) {
+        const wchar_t* wptr = reinterpret_cast<const wchar_t*>(bytes.data());
+        int wlen = (int)(bytes.size() / sizeof(wchar_t));
+        // Determine target codepage from doc->encoding.
+        NeTabDoc* docEnc = NeTabs_GetActiveDoc(hwnd);
+        NeEncoding enc = docEnc ? (NeEncoding)docEnc->encoding : NeEncoding::UTF8;
+        UINT cp = CP_UTF8;
+        if      (enc == NeEncoding::UTF16LE)   cp = 1200;
+        else if (enc == NeEncoding::ANSI)      cp = CP_ACP;
+        else if (enc == NeEncoding::Win1252)   cp = 1252;
+        else if (enc == NeEncoding::ISO8859_1) cp = 28591;
+
+        if (cp == 1200) {
+            // UTF-16LE: write raw wide chars (no BOM, matching what we load).
+            writeBytes.assign(reinterpret_cast<const char*>(wptr), (size_t)wlen * sizeof(wchar_t));
+        } else {
+            int n = WideCharToMultiByte(cp, 0, wptr, wlen, NULL, 0, "?", NULL);
+            if (n > 0) {
+                writeBytes.resize(n);
+                WideCharToMultiByte(cp, 0, wptr, wlen, writeBytes.data(), n, "?", NULL);
+            }
+        }
+    } else {
+        writeBytes = bytes;
+    }
+
     FILE* f = nullptr;
-    if (_wfopen_s(&f, path.c_str(), L"wb") != 0 || !f) {
+    if (_wfopen_s(&f, savePath.c_str(), L"wb") != 0 || !f) {
         MessageBoxW(hwnd, Ls(L"MSG_SAVE_ERR"), Ls(L"APP_NAME"), MB_OK | MB_ICONERROR);
         return false;
     }
-    fwrite(bytes.c_str(), 1, bytes.size(), f);
+    fwrite(writeBytes.c_str(), 1, writeBytes.size(), f);
     fclose(f);
+
+    // Update stored encoding.
+    {
+        NeTabDoc* doc2 = NeTabs_GetActiveDoc(hwnd);
+        if (doc2) {
+            if (asRtf) doc2->encoding = (int)NeEncoding::RichText;
+            // else: encoding was already set by the user choice or detected on load;
+            //       keep it unless it was Unknown.
+            else if ((NeEncoding)doc2->encoding == NeEncoding::Unknown)
+                doc2->encoding = (int)NeEncoding::UTF8;
+        }
+    }
+
+    // If we just saved an RTF and it was converted from a plain text file,
+    // offer to delete the original.
+    if (asRtf) {
+        NeTabDoc* doc3 = NeTabs_GetActiveDoc(hwnd);
+        if (doc3 && !doc3->prevPlainPath.empty()) {
+            std::wstring prevPath = doc3->prevPlainPath;
+            doc3->prevPlainPath.clear(); // clear regardless of answer
+            std::wstring msg = std::wstring(Ls(L"MSG_DEL_PLAIN_FILE"))
+                               + L"\n\n" + prevPath;
+            if (MessageBoxW(hwnd, msg.c_str(), Ls(L"APP_NAME"),
+                            MB_YESNO | MB_ICONQUESTION) == IDYES) {
+                DeleteFileW(prevPath.c_str());
+            }
+        }
+    }
+
+    // If we redirected to a different path (e.g. plain→rtf), refresh the UI.
+    if (savePath != path) {
+        NeTabs_UpdateTabTitle(hwnd, NeTabs_GetActiveIndex(hwnd));
+        Ne_UpdateTitle(hwnd);
+    }
     return true;
 }
 
@@ -1412,8 +3946,14 @@ static bool Ne_CloseTabAt(HWND hwnd, int index)
     Ne_UpdateTitle(hwnd);
 
     if (!Ne_PromptSaveIfModified(hwnd)) return false;
+
+    // Detach scrollbars before the edit HWND is destroyed
+    HWND hEditPre = NeTabs_GetActiveEdit(hwnd);
+    Ne_DetachScrollbars(hEditPre);
+
     if (!NeTabs_CloseTab(hwnd, index)) return false;
 
+    Ne_SyncScrollbarVisibility(hwnd);
     Ne_UpdateStatusText(hwnd);
     Ne_UpdateTitle(hwnd);
     HWND hEdit = NeTabs_GetActiveEdit(hwnd);
@@ -1529,7 +4069,26 @@ static int Ne_LayoutToolbar(HWND hwnd, int cW, int topY)
         { IDC_NE_NUMBERED,    wAl,   sG },
         { IDC_NE_COLOR,       wCol,  bG },
         { IDC_NE_HIGHLIGHT,   wCol,  sG },
-        { IDC_NE_IMAGE,       wCol,  0  },
+        { IDC_NE_IMAGE,       wCol,  sG },
+        // ── Indent
+        { IDC_NE_INDENT_IN,   wXs,   bG },
+        { IDC_NE_INDENT_OUT,  wXs,   sG },
+        // ── Line / paragraph spacing
+        { IDC_NE_LINESPACE,   wXs,   bG },
+        { IDC_NE_PARSPACE,    wXs,   sG },
+        // ── Find & insert
+        { IDC_NE_FIND,        wCol,  bG },
+        { IDC_NE_LINK,        wCol,  bG },
+        { IDC_NE_TABLE,      wCol - S(13), 0 },
+        { IDC_NE_TABLE_DROP, S(13),           bG },
+        { IDC_NE_HLINE,       wCol,  sG },
+        // ── Clear / print
+        { IDC_NE_CLEARFMT,    wCol,  bG },
+        { IDC_NE_PRINT_BTN,   wCol,  sG },
+        // ── Zoom / wrap / case
+        { IDC_NE_ZOOM,        S(72), bG },
+        { IDC_NE_WORDWRAP,    wXs,   bG },
+        { IDC_NE_CASE,        wXs,   0  },
     };
     const int N = (int)(sizeof(ctrls) / sizeof(ctrls[0]));
 
@@ -1572,31 +4131,26 @@ static int Ne_LayoutToolbar(HWND hwnd, int cW, int topY)
         x += ctrls[i].w + ctrls[i].gap;
     }
 
-    // ── Compute minimum client width analytically ─────────────────────────────
-    // For the current row assignment, each row has a fixed pixel extent.
-    // The minimum cW that keeps every control in its current row is:
-    //   for each row r:  row_min = pad + (sum of w+gap for all controls in r
-    //                               except the trailing gap of the last one) + pad
-    // minClientW = max over all rows.
-    // This is stable: at exactly minClientW, no control wraps, so the layout
-    // is identical and the stored value remains correct until the next WM_SIZE.
-    // WM_GETMINMAXINFO uses this to prevent the window from shrinking further.
+    // ── Compute minimum client width ──────────────────────────────────────────
+    // Allow narrowing until at most 3 controls fit per row.
+    // Minimum = padding + (3 widest controls + their inter-gaps).
     NeState* st = (NeState*)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
-    if (st && numRows > 0) {
-        int minCW = 0;
-        for (int r = 0; r < numRows; ++r) {
-            int rx = pad;
-            for (int i = 0; i < N; ++i) {
-                if (rowOf[i] != r) continue;
-                rx += ctrls[i].w;
-                // Add inter-control gap, but not the trailing gap of the
-                // last control in this row (it does not consume row space).
-                bool isLastInRow = (i == N - 1 || rowOf[i + 1] != r);
-                if (!isLastInRow) rx += ctrls[i].gap;
-            }
-            minCW = std::max(minCW, rx + pad);  // rx already includes left pad
+    if (st) {
+        // Collect the 3 largest widths (including their right-gap so the
+        // greedy packing check is consistent).
+        int top3w[3] = {0, 0, 0};
+        int top3g[3] = {0, 0, 0};
+        for (int i = 0; i < N; ++i) {
+            int w = ctrls[i].w;
+            int g = ctrls[i].gap;
+            if (w > top3w[0]) { top3w[2]=top3w[1]; top3g[2]=top3g[1]; top3w[1]=top3w[0]; top3g[1]=top3g[0]; top3w[0]=w; top3g[0]=g; }
+            else if (w > top3w[1]) { top3w[2]=top3w[1]; top3g[2]=top3g[1]; top3w[1]=w; top3g[1]=g; }
+            else if (w > top3w[2]) { top3w[2]=w; top3g[2]=g; }
         }
-        st->minClientW = minCW;
+        // Width needed to fit those 3 items (no trailing gap on the last one).
+        st->minClientW = pad + top3w[0] + top3g[0]
+                             + top3w[1] + top3g[1]
+                             + top3w[2] + pad;
     }
 
     return topY + numRows * rowH + S(2);
@@ -1990,6 +4544,21 @@ static LRESULT CALLBACK Ne_WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
         Ne_AppendMenuOD(hEdit2, MF_SEPARATOR, 0,             NULL);
         Ne_AppendMenuOD(hEdit2, MF_STRING,    IDM_SELECTALL, Ls(L"MENU_SELECTALL"));
         Ne_AppendMenuOD(hMenu, MF_POPUP, (UINT_PTR)hEdit2, Ls(L"MENU_EDIT"), true);
+        // ── Convert menu ──────────────────────────────────────────────────────
+        HMENU hEncSub = CreatePopupMenu();
+        Ne_AppendMenuOD(hEncSub, MF_STRING, IDM_ENC_UTF8,      Ls(L"MENU_ENC_UTF8"));
+        Ne_AppendMenuOD(hEncSub, MF_STRING, IDM_ENC_UTF16LE,   Ls(L"MENU_ENC_UTF16LE"));
+        Ne_AppendMenuOD(hEncSub, MF_SEPARATOR, 0,              NULL);
+        Ne_AppendMenuOD(hEncSub, MF_STRING, IDM_ENC_WIN1252,   Ls(L"MENU_ENC_WIN1252"));
+        Ne_AppendMenuOD(hEncSub, MF_STRING, IDM_ENC_ISO8859_1, Ls(L"MENU_ENC_ISO8859_1"));
+        Ne_AppendMenuOD(hEncSub, MF_STRING, IDM_ENC_ANSI,      Ls(L"MENU_ENC_ANSI"));
+        HMENU hConv = CreatePopupMenu();
+        Ne_AppendMenuOD(hConv, MF_STRING,    IDM_CONV_TO_PLAIN, Ls(L"MENU_CONV_TO_PLAIN"));
+        Ne_AppendMenuOD(hConv, MF_STRING,    IDM_CONV_TO_RTF,   Ls(L"MENU_CONV_TO_RTF"));
+        Ne_AppendMenuOD(hConv, MF_SEPARATOR, 0,                NULL);
+        Ne_AppendMenuOD(hConv, MF_POPUP | MF_STRING,
+                        (UINT_PTR)hEncSub, Ls(L"MENU_ENCODING"));
+        Ne_AppendMenuOD(hMenu, MF_POPUP, (UINT_PTR)hConv, Ls(L"MENU_CONVERT"), true);
         // ── Help menu ─────────────────────────────────────────────────────────
         HMENU hHelp = CreatePopupMenu();
         Ne_AppendMenuOD(hHelp, MF_STRING,    IDM_SHORTCUTS, Ls(L"MENU_SHORTCUTS"));
@@ -2021,27 +4590,27 @@ static LRESULT CALLBACK Ne_WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
         const int wCol = bSz + S(10);
 
         HWND hBold = CreateWindowExW(0, L"BUTTON", L"B",
-            WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX|BS_PUSHLIKE,
+            WS_CHILD|WS_VISIBLE|BS_OWNERDRAW,
             0, 0, bSz, bSz, hwnd, (HMENU)(UINT_PTR)IDC_NE_BOLD, hInst, NULL);
 
         HWND hItalic = CreateWindowExW(0, L"BUTTON", L"I",
-            WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX|BS_PUSHLIKE,
+            WS_CHILD|WS_VISIBLE|BS_OWNERDRAW,
             0, 0, bSz, bSz, hwnd, (HMENU)(UINT_PTR)IDC_NE_ITALIC, hInst, NULL);
 
         HWND hUnder = CreateWindowExW(0, L"BUTTON", L"U",
-            WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX|BS_PUSHLIKE,
+            WS_CHILD|WS_VISIBLE|BS_OWNERDRAW,
             0, 0, bSz, bSz, hwnd, (HMENU)(UINT_PTR)IDC_NE_UNDERLINE, hInst, NULL);
 
         CreateWindowExW(0, L"BUTTON", L"S\u0336",
-            WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX|BS_PUSHLIKE,
+            WS_CHILD|WS_VISIBLE|BS_OWNERDRAW,
             0, 0, bSz, bSz, hwnd, (HMENU)(UINT_PTR)IDC_NE_STRIKE, hInst, NULL);
 
         CreateWindowExW(0, L"BUTTON", L"X\u2082",
-            WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX|BS_PUSHLIKE,
+            WS_CHILD|WS_VISIBLE|BS_OWNERDRAW,
             0, 0, wXs, bSz, hwnd, (HMENU)(UINT_PTR)IDC_NE_SUBSCRIPT, hInst, NULL);
 
         CreateWindowExW(0, L"BUTTON", L"X\u00B2",
-            WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX|BS_PUSHLIKE,
+            WS_CHILD|WS_VISIBLE|BS_OWNERDRAW,
             0, 0, wXs, bSz, hwnd, (HMENU)(UINT_PTR)IDC_NE_SUPERSCRIPT, hInst, NULL);
 
         HWND hFace = CreateWindowExW(0, L"COMBOBOX", L"",
@@ -2074,40 +4643,103 @@ static LRESULT CALLBACK Ne_WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
         SendMessageW(hSzCombo, CB_SETCURSEL, s_neFontDefault, 0);
 
         CreateWindowExW(0, L"BUTTON", L"\u2261L",
-            WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX|BS_PUSHLIKE,
+            WS_CHILD|WS_VISIBLE|BS_OWNERDRAW,
             0, 0, wAl, bSz, hwnd, (HMENU)(UINT_PTR)IDC_NE_ALIGN_L, hInst, NULL);
 
         CreateWindowExW(0, L"BUTTON", L"\u2261C",
-            WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX|BS_PUSHLIKE,
+            WS_CHILD|WS_VISIBLE|BS_OWNERDRAW,
             0, 0, wAl, bSz, hwnd, (HMENU)(UINT_PTR)IDC_NE_ALIGN_C, hInst, NULL);
 
         CreateWindowExW(0, L"BUTTON", L"\u2261R",
-            WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX|BS_PUSHLIKE,
+            WS_CHILD|WS_VISIBLE|BS_OWNERDRAW,
             0, 0, wAl, bSz, hwnd, (HMENU)(UINT_PTR)IDC_NE_ALIGN_R, hInst, NULL);
 
         CreateWindowExW(0, L"BUTTON", L"\u2261J",
-            WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX|BS_PUSHLIKE,
+            WS_CHILD|WS_VISIBLE|BS_OWNERDRAW,
             0, 0, wAl, bSz, hwnd, (HMENU)(UINT_PTR)IDC_NE_ALIGN_J, hInst, NULL);
 
         CreateWindowExW(0, L"BUTTON", L"\u2022",
-            WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX|BS_PUSHLIKE,
+            WS_CHILD|WS_VISIBLE|BS_OWNERDRAW,
             0, 0, wAl, bSz, hwnd, (HMENU)(UINT_PTR)IDC_NE_BULLET, hInst, NULL);
 
         CreateWindowExW(0, L"BUTTON", L"1.",
-            WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX|BS_PUSHLIKE,
+            WS_CHILD|WS_VISIBLE|BS_OWNERDRAW,
             0, 0, wAl, bSz, hwnd, (HMENU)(UINT_PTR)IDC_NE_NUMBERED, hInst, NULL);
 
         HWND hColor = CreateWindowExW(0, L"BUTTON", L"A\u25BC",
-            WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON,
+            WS_CHILD|WS_VISIBLE|BS_OWNERDRAW,
             0, 0, wCol, bSz, hwnd, (HMENU)(UINT_PTR)IDC_NE_COLOR, hInst, NULL);
 
         CreateWindowExW(0, L"BUTTON", L"H\u25BC",
-            WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON,
+            WS_CHILD|WS_VISIBLE|BS_OWNERDRAW,
             0, 0, wCol, bSz, hwnd, (HMENU)(UINT_PTR)IDC_NE_HIGHLIGHT, hInst, NULL);
 
         HWND hImgBtn = CreateWindowExW(0, L"BUTTON", L"\U0001F5BC",
-            WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON,
+            WS_CHILD|WS_VISIBLE|BS_OWNERDRAW,
             0, 0, wCol, bSz, hwnd, (HMENU)(UINT_PTR)IDC_NE_IMAGE, hInst, NULL);
+
+        // ── New toolbar controls ──────────────────────────────────────────────
+        CreateWindowExW(0, L"BUTTON", L"\u21E5",
+            WS_CHILD|WS_VISIBLE|BS_OWNERDRAW,
+            0, 0, wXs, bSz, hwnd, (HMENU)(UINT_PTR)IDC_NE_INDENT_IN, hInst, NULL);
+
+        CreateWindowExW(0, L"BUTTON", L"\u21E4",
+            WS_CHILD|WS_VISIBLE|BS_OWNERDRAW,
+            0, 0, wXs, bSz, hwnd, (HMENU)(UINT_PTR)IDC_NE_INDENT_OUT, hInst, NULL);
+
+        HWND hLineSpBtn = CreateWindowExW(0, L"BUTTON", L"\u2195",
+            WS_CHILD|WS_VISIBLE|BS_OWNERDRAW,
+            0, 0, wXs, bSz, hwnd, (HMENU)(UINT_PTR)IDC_NE_LINESPACE, hInst, NULL);
+
+        HWND hFindBtn = CreateWindowExW(0, L"BUTTON", L"\u2315",
+            WS_CHILD|WS_VISIBLE|BS_OWNERDRAW,
+            0, 0, wCol, bSz, hwnd, (HMENU)(UINT_PTR)IDC_NE_FIND, hInst, NULL);
+
+        HWND hLinkBtn = CreateWindowExW(0, L"BUTTON", L"\U0001F517",
+            WS_CHILD|WS_VISIBLE|BS_OWNERDRAW,
+            0, 0, wCol, bSz, hwnd, (HMENU)(UINT_PTR)IDC_NE_LINK, hInst, NULL);
+
+        HWND hTableBtn = CreateWindowExW(0, L"BUTTON", L"\u229E",
+            WS_CHILD|WS_VISIBLE|BS_OWNERDRAW,
+            0, 0, wCol - S(13), bSz, hwnd, (HMENU)(UINT_PTR)IDC_NE_TABLE, hInst, NULL);
+        HWND hTableDrop = CreateWindowExW(0, L"BUTTON", L"\u25BC",
+            WS_CHILD|WS_VISIBLE|BS_OWNERDRAW,
+            0, 0, S(13), bSz, hwnd, (HMENU)(UINT_PTR)IDC_NE_TABLE_DROP, hInst, NULL);
+
+        HWND hHlineBtn = CreateWindowExW(0, L"BUTTON", L"\u2500",
+            WS_CHILD|WS_VISIBLE|BS_OWNERDRAW,
+            0, 0, wCol, bSz, hwnd, (HMENU)(UINT_PTR)IDC_NE_HLINE, hInst, NULL);
+
+        HWND hClearFmtBtn = CreateWindowExW(0, L"BUTTON", L"\u2205",
+            WS_CHILD|WS_VISIBLE|BS_OWNERDRAW,
+            0, 0, wCol, bSz, hwnd, (HMENU)(UINT_PTR)IDC_NE_CLEARFMT, hInst, NULL);
+
+        HWND hPrintBtn = CreateWindowExW(0, L"BUTTON", L"\u2399",
+            WS_CHILD|WS_VISIBLE|BS_OWNERDRAW,
+            0, 0, wCol, bSz, hwnd, (HMENU)(UINT_PTR)IDC_NE_PRINT_BTN, hInst, NULL);
+
+        // Zoom combobox.
+        HWND hZoom = CreateWindowExW(0, L"COMBOBOX", L"",
+            WS_CHILD|WS_VISIBLE|CBS_DROPDOWNLIST|WS_VSCROLL,
+            0, 0, S(72), S(200), hwnd, (HMENU)(UINT_PTR)IDC_NE_ZOOM, hInst, NULL);
+        {
+            const wchar_t* zooms[] = { L"50%", L"75%", L"100%", L"125%", L"150%", L"200%" };
+            for (auto z : zooms) SendMessageW(hZoom, CB_ADDSTRING, 0, (LPARAM)z);
+            SendMessageW(hZoom, CB_SETCURSEL, 2, 0); // default 100%
+        }
+
+        HWND hWrapBtn = CreateWindowExW(0, L"BUTTON", L"\u21B5",
+            WS_CHILD|WS_VISIBLE|BS_OWNERDRAW,
+            0, 0, wXs, bSz, hwnd, (HMENU)(UINT_PTR)IDC_NE_WORDWRAP, hInst, NULL);
+        SendMessageW(hWrapBtn, BM_SETCHECK, BST_CHECKED, 0); // word wrap on by default
+
+        HWND hCaseBtn = CreateWindowExW(0, L"BUTTON", L"Aa",
+            WS_CHILD|WS_VISIBLE|BS_OWNERDRAW,
+            0, 0, wXs, bSz, hwnd, (HMENU)(UINT_PTR)IDC_NE_CASE, hInst, NULL);
+
+        HWND hParSpBtn = CreateWindowExW(0, L"BUTTON", L"\u00B6\u2195",
+            WS_CHILD|WS_VISIBLE|BS_OWNERDRAW,
+            0, 0, wXs, bSz, hwnd, (HMENU)(UINT_PTR)IDC_NE_PARSPACE, hInst, NULL);
 
         // ── Status bar ────────────────────────────────────────────────────────
         HWND hSb = NeStatusBar_Create(hwnd, IDC_NE_STATUSBAR, hInst);
@@ -2153,8 +4785,14 @@ static LRESULT CALLBACK Ne_WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
             wcsncpy_s(cfD.szFaceName, L"Segoe UI", LF_FACESIZE - 1);
             SendMessageW(hEdit, EM_SETCHARFORMAT, SCF_ALL, (LPARAM)&cfD);
             SendMessageW(hEdit, EM_SETBKGNDCOLOR, 0, RGB(255, 255, 255));
-            SendMessageW(hEdit, EM_SETEVENTMASK, 0, ENM_CHANGE | ENM_SELCHANGE);
+            SendMessageW(hEdit, EM_SETEVENTMASK, 0, ENM_CHANGE | ENM_SELCHANGE | ENM_LINK);
+            Ne_SubclassEditForCaret(hEdit);
+            SendMessageW(hEdit, EM_SETEVENTMASK, 0, ENM_SELCHANGE);  // suppress EN_CHANGE during attach
+            Ne_AttachScrollbars(hEdit);
+            SendMessageW(hEdit, EM_SETEVENTMASK, 0, ENM_CHANGE | ENM_SELCHANGE | ENM_LINK);
         }
+
+        Ne_SyncScrollbarVisibility(hwnd);
 
         // ── Apply system font to toolbar buttons / combos ─────────────────────
         NONCLIENTMETRICSW ncm = {}; ncm.cbSize = sizeof(ncm);
@@ -2209,6 +4847,20 @@ static LRESULT CALLBACK Ne_WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
         Ne_SetTip(GetDlgItem(hwnd, IDC_NE_BULLET),         Ls(L"TIP_BULLET"));
         Ne_SetTip(GetDlgItem(hwnd, IDC_NE_NUMBERED),       Ls(L"TIP_NUMBERED"));
         Ne_SetTip(hImgBtn,                                  Ls(L"TIP_IMAGE"));
+        Ne_SetTip(GetDlgItem(hwnd, IDC_NE_INDENT_IN),      Ls(L"TIP_INDENT_IN"));
+        Ne_SetTip(GetDlgItem(hwnd, IDC_NE_INDENT_OUT),     Ls(L"TIP_INDENT_OUT"));
+        Ne_SetTip(hLineSpBtn,                               Ls(L"TIP_LINESPACE"));
+        Ne_SetTip(hFindBtn,                                 Ls(L"TIP_FIND"));
+        Ne_SetTip(hLinkBtn,                                 Ls(L"TIP_LINK"));
+        Ne_SetTip(hTableBtn,                                Ls(L"TIP_TABLE"));
+        Ne_SetTip(hTableDrop,                               Ls(L"TIP_TABLE_DROP"));
+        Ne_SetTip(hHlineBtn,                                Ls(L"TIP_HLINE"));
+        Ne_SetTip(hClearFmtBtn,                             Ls(L"TIP_CLEARFMT"));
+        Ne_SetTip(hPrintBtn,                                Ls(L"TIP_PRINT_BTN"));
+        Ne_SetTip(hZoom,                                    Ls(L"TIP_ZOOM"));
+        Ne_SetTip(hWrapBtn,                                 Ls(L"TIP_WORDWRAP"));
+        Ne_SetTip(hCaseBtn,                                 Ls(L"TIP_CASE"));
+        Ne_SetTip(hParSpBtn,                                Ls(L"TIP_PARSPACE"));
 
         if (hEdit) SetFocus(hEdit);
         if (hEdit) Ne_SyncToolbar(hwnd, hEdit);
@@ -2241,6 +4893,7 @@ static LRESULT CALLBACK Ne_WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
             NeTabs_SetRects(hwnd,
                 pad, st->tabY, cW - 2 * pad, st->tabH,
                 pad, newEditY, cW - 2 * pad, editH);
+            Ne_SyncScrollbarVisibility(hwnd);
         }
         return 0;
     }
@@ -2253,6 +4906,14 @@ static LRESULT CALLBACK Ne_WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
         int wmEv  = HIWORD(wParam);
 
         // ── File menu ─────────────────────────────────────────────────────────
+        if (wmId == IDM_CTX_TABLE_PROPS) {
+            if (hEdit) Ne_ShowTablePropsDialog(hwnd, hEdit);
+            return 0;
+        }
+        if (wmId == IDM_CTX_HRULE_PROPS) {
+            if (hEdit) Ne_EditHRuleProps(hwnd, hEdit);
+            return 0;
+        }
         if (wmId == IDM_NEW || wmId == IDC_NE_TABCTRL + 10) { Ne_New(hwnd); return 0; }
         if (wmId == IDM_OPEN)       { Ne_Open(hwnd);              return 0; }
         if (wmId == IDM_SAVE)       { Ne_Save(hwnd);              return 0; }
@@ -2260,6 +4921,69 @@ static LRESULT CALLBACK Ne_WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
         if (wmId == IDM_EXIT)       { PostMessageW(hwnd, WM_CLOSE, 0, 0); return 0; }
         if (wmId == IDM_PRINT)      { Ne_Print(hwnd);             return 0; }
         if (wmId == IDM_EXPORT_PDF) { Ne_ExportPdf(hwnd);         return 0; }
+        // ── Convert menu ──────────────────────────────────────────────────────
+        if (wmId == IDM_CONV_TO_PLAIN) {
+            HWND hEd = NeTabs_GetActiveEdit(hwnd);
+            NeTabDoc* doc = NeTabs_GetActiveDoc(hwnd);
+            if (!hEd || !doc) return 0;
+            if (MessageBoxW(hwnd, Ls(L"MSG_CONV_LOSSY"), Ls(L"APP_NAME"),
+                            MB_YESNO | MB_ICONWARNING) != IDYES) return 0;
+            // Pull plain text, stream back in as plain, update path/encoding.
+            std::string plain = Ne_StreamOut(hEd, false);
+            doc->suppressChange = true;
+            Ne_StreamIn(hEd, plain, false);
+            doc->suppressChange = false;
+            doc->encoding = (int)NeEncoding::UTF8;
+            // If the file had a .rtf extension, change it to .txt.
+            if (Ne_DocIsRtf(doc)) {
+                size_t dot = doc->path.rfind(L'.');
+                doc->path = (dot != std::wstring::npos ? doc->path.substr(0, dot) : doc->path) + L".txt";
+            }
+            doc->modified = true;
+            NeTabs_UpdateTabTitle(hwnd, NeTabs_GetActiveIndex(hwnd));
+            Ne_UpdateTitle(hwnd);
+            Ne_UpdateStatusText(hwnd);
+            return 0;
+        }
+        if (wmId == IDM_CONV_TO_RTF) {
+            HWND hEd = NeTabs_GetActiveEdit(hwnd);
+            NeTabDoc* doc = NeTabs_GetActiveDoc(hwnd);
+            if (!hEd || !doc || Ne_DocIsRtf(doc)) return 0;
+            // Build the .rtf path and remember the old plain path.
+            std::wstring oldPath = doc->path;
+            size_t dot = doc->path.rfind(L'.');
+            doc->path = (dot != std::wstring::npos ? doc->path.substr(0, dot) : doc->path) + L".rtf";
+            if (!oldPath.empty()) doc->prevPlainPath = oldPath;
+            doc->encoding = (int)NeEncoding::RichText;
+            doc->modified = true;
+            NeTabs_UpdateTabTitle(hwnd, NeTabs_GetActiveIndex(hwnd));
+            Ne_UpdateTitle(hwnd);
+            Ne_UpdateStatusText(hwnd);
+            return 0;
+        }
+        if (wmId >= IDM_ENC_UTF8 && wmId <= IDM_ENC_ISO8859_1) {
+            HWND hEd = NeTabs_GetActiveEdit(hwnd);
+            NeTabDoc* doc = NeTabs_GetActiveDoc(hwnd);
+            if (!hEd || !doc) return 0;
+            // Map command → NeEncoding + codepage for narrow conversion.
+            NeEncoding newEnc = NeEncoding::UTF8;
+            UINT cp = CP_UTF8;
+            if      (wmId == IDM_ENC_UTF8)      { newEnc = NeEncoding::UTF8;      cp = CP_UTF8; }
+            else if (wmId == IDM_ENC_UTF16LE)   { newEnc = NeEncoding::UTF16LE;   cp = 1200;    }
+            else if (wmId == IDM_ENC_ANSI)      { newEnc = NeEncoding::ANSI;      cp = CP_ACP;  }
+            else if (wmId == IDM_ENC_WIN1252)   { newEnc = NeEncoding::Win1252;   cp = 1252;    }
+            else if (wmId == IDM_ENC_ISO8859_1) { newEnc = NeEncoding::ISO8859_1; cp = 28591;   }
+            if ((NeEncoding)doc->encoding == newEnc) return 0; // nothing to do
+            // Warn if encoding change could be lossy (anything narrower than UTF-8/16).
+            if (cp != CP_UTF8 && cp != 1200) {
+                if (MessageBoxW(hwnd, Ls(L"MSG_ENC_LOSSY"), Ls(L"APP_NAME"),
+                                MB_YESNO | MB_ICONWARNING) != IDYES) return 0;
+            }
+            doc->encoding = (int)newEnc;
+            doc->modified = true;   // needs re-saving in new encoding
+            Ne_UpdateStatusText(hwnd);
+            return 0;
+        }
         // ── Edit menu ─────────────────────────────────────────────────────────
         if (wmId == IDM_UNDO)      { if (hEdit) SendMessageW(hEdit, WM_UNDO, 0, 0);                  SetFocus(hEdit); return 0; }
         if (wmId == IDM_REDO)      { if (hEdit) SendMessageW(hEdit, EM_REDO, 0, 0);                  SetFocus(hEdit); return 0; }
@@ -2367,6 +5091,40 @@ static LRESULT CALLBACK Ne_WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
         // ── Insert image ──────────────────────────────────────────────────────
         if (wmId == IDC_NE_IMAGE) { Ne_InsertImage(hwnd, hEdit); return 0; }
 
+        // ── New toolbar handlers ───────────────────────────────────────────────
+        if (wmId == IDC_NE_INDENT_IN)  { Ne_Indent(hEdit, true);  SetFocus(hEdit); return 0; }
+        if (wmId == IDC_NE_INDENT_OUT) { Ne_Indent(hEdit, false); SetFocus(hEdit); return 0; }
+        if (wmId == IDC_NE_LINESPACE)  { Ne_ShowLineSpaceDialog(hwnd, hEdit); return 0; }
+        if (wmId == IDC_NE_PARSPACE)   { Ne_ShowParSpaceDialog(hwnd, hEdit);  return 0; }
+        if (wmId == IDC_NE_FIND)       { Ne_ShowFindDialog(hwnd, hEdit);      return 0; }
+        if (wmId == IDC_NE_LINK)       { Ne_ShowLinkDialog(hwnd, hEdit);      return 0; }
+        if (wmId == IDC_NE_TABLE) {
+            Ne_ShowTablePropsDialog(hwnd, hEdit);
+            return 0;
+        }
+        if (wmId == IDC_NE_TABLE_DROP) {
+            HWND hBtn = GetDlgItem(hwnd, IDC_NE_TABLE_DROP);
+            Ne_ShowTablePicker(hwnd, hEdit, hBtn);
+            return 0;
+        }
+        if (wmId == IDC_NE_HLINE)      { Ne_InsertHRule(hwnd, hEdit); SetFocus(hEdit); return 0; }
+        if (wmId == IDC_NE_CLEARFMT)   { Ne_ClearFormatting(hEdit); Ne_SyncToolbar(hwnd, hEdit); SetFocus(hEdit); return 0; }
+        if (wmId == IDC_NE_PRINT_BTN)  { SendMessageW(hwnd, WM_COMMAND, IDM_PRINT, 0); return 0; }
+        if (wmId == IDC_NE_WORDWRAP)   { Ne_ToggleWordWrap(hwnd, hEdit); SetFocus(hEdit); return 0; }
+        if (wmId == IDC_NE_CASE)       { Ne_ToggleCase(hEdit); SetFocus(hEdit); return 0; }
+
+        // ── Zoom combobox ─────────────────────────────────────────────────────
+        if (wmId == IDC_NE_ZOOM && wmEv == CBN_SELCHANGE) {
+            HWND hZ = GetDlgItem(hwnd, IDC_NE_ZOOM);
+            int sel = (int)SendMessageW(hZ, CB_GETCURSEL, 0, 0);
+            static const int zoomPcts[] = { 50, 75, 100, 125, 150, 200 };
+            if (sel >= 0 && sel < 6) {
+                int pct = zoomPcts[sel];
+                SendMessageW(hEdit, EM_SETZOOM, (WPARAM)pct, 100);
+            }
+            SetFocus(hEdit); return 0;
+        }
+
         // ── Font face ─────────────────────────────────────────────────────────
         if (wmId == IDC_NE_FONTFACE && wmEv == CBN_SELCHANGE && st && !st->updatingToolbar) {
             CHARRANGE cr = {}; SendMessageW(hEdit, EM_EXGETSEL, 0, (LPARAM)&cr);
@@ -2410,6 +5168,9 @@ static LRESULT CALLBACK Ne_WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
                 NeTabs_UpdateTabTitle(hwnd, idx);
                 Ne_UpdateTitle(hwnd);
                 Ne_UpdateStatusText(hwnd);
+                // Notify custom scrollbars that content dimensions may have changed
+                auto ih = s_sbH.find(hSrcEdit);
+                if (ih != s_sbH.end() && ih->second) msb_notify_content_changed(ih->second);
             }
             if (wmEv == EN_KILLFOCUS && doc) {
                 Ne_RememberDiskStamp(doc);
@@ -2425,11 +5186,38 @@ static LRESULT CALLBACK Ne_WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
 
     case WM_NOTIFY: {
         LPNMHDR nh = (LPNMHDR)lParam;
+        if (nh && nh->code == EN_LINK) {
+            ENLINK* el = (ENLINK*)lParam;
+            // EN_LINK fallback for Ctrl+Click (subclass handles primary path).
+            // Use RTF stream to get the real URL from the field instruction.
+            if (el->msg == WM_LBUTTONDOWN && (GetKeyState(VK_CONTROL) & 0x8000)) {
+                HideTooltip();
+                std::wstring url = Ne_ExtractLinkUrlAt(nh->hwndFrom,
+                                       (el->chrg.cpMin + el->chrg.cpMax) / 2);
+                if (url.empty()) {
+                    // Fall back: try display text in case it IS the URL
+                    int len = el->chrg.cpMax - el->chrg.cpMin;
+                    if (len > 0 && len < 2048) {
+                        std::wstring disp(len + 1, L'\0');
+                        TEXTRANGEW tr = {}; tr.chrg = el->chrg; tr.lpstrText = &disp[0];
+                        SendMessageW(nh->hwndFrom, EM_GETTEXTRANGE, 0, (LPARAM)&tr);
+                        disp.resize(wcslen(disp.c_str()));
+                        if (disp.find(L"http") == 0 || disp.find(L"www.") == 0)
+                            url = disp;
+                    }
+                }
+                if (!url.empty())
+                    ShellExecuteW(NULL, L"open", url.c_str(), NULL, NULL, SW_SHOWNORMAL);
+                return 1;
+            }
+            return 0;
+        }
         if (nh && nh->idFrom == IDC_NE_TABCTRL && nh->code == TCN_SELCHANGE) {
             int idx = TabCtrl_GetCurSel(NeTabs_GetTabHwnd(hwnd));
             if (NeTabs_SetActive(hwnd, idx)) {
                 HWND hEdit = NeTabs_GetActiveEdit(hwnd);
                 if (hEdit) Ne_SyncToolbar(hwnd, hEdit);
+                Ne_SyncScrollbarVisibility(hwnd);
                 Ne_UpdateStatusText(hwnd);
                 Ne_UpdateTitle(hwnd);
             }
@@ -2506,6 +5294,16 @@ static LRESULT CALLBACK Ne_WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
         AppendMenuW(hCtx, MF_STRING, IDM_PASTE, Ls(L"MENU_PASTE"));
         AppendMenuW(hCtx, MF_SEPARATOR, 0, NULL);
         AppendMenuW(hCtx, MF_STRING, IDM_SELECTALL, Ls(L"MENU_SELECTALL"));
+        // Table properties — shown only when caret is inside a table
+        if (Ne_CaretInTable(hEdit)) {
+            AppendMenuW(hCtx, MF_SEPARATOR, 0, NULL);
+            AppendMenuW(hCtx, MF_STRING, IDM_CTX_TABLE_PROPS, Ls(L"CTX_TABLE_PROPS"));
+        }
+        // Horizontal rule properties — shown only when caret is on a rule paragraph
+        if (Ne_CaretOnHRule(hEdit)) {
+            AppendMenuW(hCtx, MF_SEPARATOR, 0, NULL);
+            AppendMenuW(hCtx, MF_STRING, IDM_CTX_HRULE_PROPS, L"Horizontal Rule Properties...");
+        }
 
         int sx = GET_X_LPARAM(lParam), sy = GET_Y_LPARAM(lParam);
         if (sx == -1 && sy == -1) {
@@ -2546,9 +5344,85 @@ static LRESULT CALLBACK Ne_WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
         return TRUE;
     }
 
-    // ── WM_DRAWITEM — paint owner-draw menu items ─────────────────────────────
+    // ── WM_DRAWITEM — paint owner-draw buttons and menu items ─────────────────
     case WM_DRAWITEM: {
         DRAWITEMSTRUCT* dis = (DRAWITEMSTRUCT*)lParam;
+
+        // ── Owner-draw toolbar buttons ────────────────────────────────────────
+        if (dis->CtlType == ODT_BUTTON) {
+            int    id       = (int)dis->CtlID;
+            bool   pressed  = (dis->itemState & ODS_SELECTED) != 0;
+            bool   disabled = (dis->itemState & ODS_DISABLED) != 0;
+            // For toggle buttons track checked state via BM_GETCHECK.
+            bool   checked  = (SendMessageW(dis->hwndItem, BM_GETCHECK, 0, 0) == BST_CHECKED);
+            RECT   rc       = dis->rcItem;
+
+            // Background.
+            COLORREF bg;
+            if      (pressed && checked) bg = RGB(155, 190, 235);
+            else if (pressed)            bg = RGB(185, 215, 250);
+            else if (checked)            bg = RGB(210, 230, 255);
+            else                         bg = GetSysColor(COLOR_BTNFACE);
+
+            HBRUSH hbr = CreateSolidBrush(bg);
+            FillRect(dis->hDC, &rc, hbr);
+            DeleteObject(hbr);
+
+            // Border: sunken when pressed/checked, raised otherwise.
+            DrawEdge(dis->hDC, &rc, (pressed || checked) ? EDGE_SUNKEN : EDGE_RAISED, BF_RECT);
+
+            // ── Special: TABLE_DROP button — draw just a tiny ▼ centred ──────
+            if (id == IDC_NE_TABLE_DROP) {
+                SetTextColor(dis->hDC, disabled ? GetSysColor(COLOR_GRAYTEXT) : RGB(80, 80, 80));
+                SetBkMode(dis->hDC, TRANSPARENT);
+                HFONT hSmall = CreateFontW(-S(8), 0, 0, 0, FW_NORMAL, 0, 0, 0,
+                    DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
+                HFONT hOld2 = hSmall ? (HFONT)SelectObject(dis->hDC, hSmall) : NULL;
+                RECT rcA = { rc.left + (pressed?1:0), rc.top + (pressed?1:0), rc.right, rc.bottom };
+                DrawTextW(dis->hDC, L"\u25BE", -1, &rcA, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+                if (hOld2) SelectObject(dis->hDC, hOld2);
+                if (hSmall) DeleteObject(hSmall);
+            } else
+            // ── Special: Highlight button gets a yellow colour swatch ─────────
+            if (id == IDC_NE_HIGHLIGHT) {
+                // Draw "H" in normal text colour above a yellow bar.
+                SetTextColor(dis->hDC, disabled ? GetSysColor(COLOR_GRAYTEXT) : RGB(30, 30, 30));
+                SetBkMode(dis->hDC, TRANSPARENT);
+                HFONT hf = (HFONT)SendMessageW(dis->hwndItem, WM_GETFONT, 0, 0);
+                if (!hf) hf = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+                HFONT hOld = (HFONT)SelectObject(dis->hDC, hf);
+                RECT rcTxt = { rc.left + (pressed?1:0), rc.top + (pressed?1:0),
+                               rc.right,                rc.bottom - S(6) };
+                DrawTextW(dis->hDC, L"H\u25BC", -1, &rcTxt, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+                SelectObject(dis->hDC, hOld);
+                // Yellow swatch at bottom of button.
+                RECT swRc = { rc.left + S(3), rc.bottom - S(6),
+                              rc.right - S(3), rc.bottom - S(2) };
+                HBRUSH hSw = CreateSolidBrush(RGB(255, 220, 0));
+                FillRect(dis->hDC, &swRc, hSw);
+                DeleteObject(hSw);
+            } else {
+                // Coloured text for all other buttons.
+                wchar_t txt[64] = {};
+                GetWindowTextW(dis->hwndItem, txt, 64);
+
+                COLORREF fg = disabled ? GetSysColor(COLOR_GRAYTEXT) : Ne_BtnTextColor(id);
+                SetTextColor(dis->hDC, fg);
+                SetBkMode(dis->hDC, TRANSPARENT);
+
+                HFONT hf = (HFONT)SendMessageW(dis->hwndItem, WM_GETFONT, 0, 0);
+                if (!hf) hf = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+                HFONT hOld = (HFONT)SelectObject(dis->hDC, hf);
+
+                RECT rcTxt = { rc.left + (pressed?1:0), rc.top + (pressed?1:0),
+                               rc.right, rc.bottom };
+                DrawTextW(dis->hDC, txt, -1, &rcTxt, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+                SelectObject(dis->hDC, hOld);
+            }
+            return TRUE;
+        }
+
+        // ── Owner-draw menu items ─────────────────────────────────────────────
         if (dis->CtlType != ODT_MENU || !g_hMenuFont) break;
         NeMenuItemData* d = (NeMenuItemData*)(ULONG_PTR)dis->itemData;
         if (!d) break;
@@ -2587,22 +5461,91 @@ static LRESULT CALLBACK Ne_WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
         return TRUE;
     }
 
-    // ── WM_INITMENUPOPUP — grey Edit menu items dynamically ──────────────────
+    // ── WM_INITMENUPOPUP — grey menu items dynamically ───────────────────────
     case WM_INITMENUPOPUP: {
         HMENU hPop = (HMENU)wParam;
         HWND hEdit = NeTabs_GetActiveEdit(hwnd);
         if (!hEdit) break;
-        // Only update the Edit popup (check by presence of IDM_UNDO).
-        if (GetMenuState(hPop, IDM_UNDO, MF_BYCOMMAND) == (UINT)-1) break;
-        CHARRANGE cr = {}; SendMessageW(hEdit, EM_EXGETSEL, 0, (LPARAM)&cr);
-        bool hasSel  = (cr.cpMin != cr.cpMax);
-        bool canUndo = SendMessageW(hEdit, EM_CANUNDO, 0, 0) != 0;
-        bool canRedo = SendMessageW(hEdit, EM_CANREDO, 0, 0) != 0;
-        EnableMenuItem(hPop, IDM_UNDO,  MF_BYCOMMAND | (canUndo ? MF_ENABLED : MF_GRAYED));
-        EnableMenuItem(hPop, IDM_REDO,  MF_BYCOMMAND | (canRedo ? MF_ENABLED : MF_GRAYED));
-        EnableMenuItem(hPop, IDM_CUT,   MF_BYCOMMAND | (hasSel  ? MF_ENABLED : MF_GRAYED));
-        EnableMenuItem(hPop, IDM_COPY,  MF_BYCOMMAND | (hasSel  ? MF_ENABLED : MF_GRAYED));
-        return 0;
+
+        // ── Edit popup ────────────────────────────────────────────────────────
+        if (GetMenuState(hPop, IDM_UNDO, MF_BYCOMMAND) != (UINT)-1) {
+            CHARRANGE cr = {}; SendMessageW(hEdit, EM_EXGETSEL, 0, (LPARAM)&cr);
+            bool hasSel  = (cr.cpMin != cr.cpMax);
+            bool canUndo = SendMessageW(hEdit, EM_CANUNDO, 0, 0) != 0;
+            bool canRedo = SendMessageW(hEdit, EM_CANREDO, 0, 0) != 0;
+            EnableMenuItem(hPop, IDM_UNDO,  MF_BYCOMMAND | (canUndo ? MF_ENABLED : MF_GRAYED));
+            EnableMenuItem(hPop, IDM_REDO,  MF_BYCOMMAND | (canRedo ? MF_ENABLED : MF_GRAYED));
+            EnableMenuItem(hPop, IDM_CUT,   MF_BYCOMMAND | (hasSel  ? MF_ENABLED : MF_GRAYED));
+            EnableMenuItem(hPop, IDM_COPY,  MF_BYCOMMAND | (hasSel  ? MF_ENABLED : MF_GRAYED));
+            return 0;
+        }
+
+        // ── Convert popup ─────────────────────────────────────────────────────
+        if (GetMenuState(hPop, IDM_CONV_TO_PLAIN, MF_BYCOMMAND) != (UINT)-1) {
+            NeTabDoc* doc = NeTabs_GetActiveDoc(hwnd);
+            bool isRtfDoc = Ne_DocIsRtf(doc);
+            // "Strip formatting" is only useful when the doc is currently RTF.
+            EnableMenuItem(hPop, IDM_CONV_TO_PLAIN,
+                           MF_BYCOMMAND | (isRtfDoc ? MF_ENABLED : MF_GRAYED));
+            // "Add formatting" is only useful when the doc is currently plain text.
+            EnableMenuItem(hPop, IDM_CONV_TO_RTF,
+                           MF_BYCOMMAND | (!isRtfDoc ? MF_ENABLED : MF_GRAYED));
+            return 0;
+        }
+
+        // ── Encoding sub-popup ────────────────────────────────────────────────
+        if (GetMenuState(hPop, IDM_ENC_UTF8, MF_BYCOMMAND) != (UINT)-1) {
+            NeTabDoc* doc = NeTabs_GetActiveDoc(hwnd);
+            bool isRtfDoc = Ne_DocIsRtf(doc);
+            // Encoding change is only meaningful for plain-text files.
+            UINT ef = MF_BYCOMMAND | (isRtfDoc ? MF_GRAYED : MF_ENABLED);
+            EnableMenuItem(hPop, IDM_ENC_UTF8,      ef);
+            EnableMenuItem(hPop, IDM_ENC_UTF16LE,   ef);
+            EnableMenuItem(hPop, IDM_ENC_ANSI,      ef);
+            EnableMenuItem(hPop, IDM_ENC_WIN1252,   ef);
+            EnableMenuItem(hPop, IDM_ENC_ISO8859_1, ef);
+            // Check the currently active encoding.
+            NeEncoding cur = doc ? (NeEncoding)doc->encoding : NeEncoding::Unknown;
+            CheckMenuItem(hPop, IDM_ENC_UTF8,      MF_BYCOMMAND | (cur == NeEncoding::UTF8      ? MF_CHECKED : MF_UNCHECKED));
+            CheckMenuItem(hPop, IDM_ENC_UTF16LE,   MF_BYCOMMAND | (cur == NeEncoding::UTF16LE   ? MF_CHECKED : MF_UNCHECKED));
+            CheckMenuItem(hPop, IDM_ENC_ANSI,      MF_BYCOMMAND | (cur == NeEncoding::ANSI      ? MF_CHECKED : MF_UNCHECKED));
+            CheckMenuItem(hPop, IDM_ENC_WIN1252,   MF_BYCOMMAND | (cur == NeEncoding::Win1252   ? MF_CHECKED : MF_UNCHECKED));
+            CheckMenuItem(hPop, IDM_ENC_ISO8859_1, MF_BYCOMMAND | (cur == NeEncoding::ISO8859_1 ? MF_CHECKED : MF_UNCHECKED));
+            return 0;
+        }
+        break;
+    }
+
+    // ── Fill the menu-bar gap (right of last item) with white ─────────────────
+    case WM_NCPAINT: {
+        LRESULT lr = DefWindowProcW(hwnd, WM_NCPAINT, wParam, 0);
+        HMENU hMenu = GetMenu(hwnd);
+        if (hMenu && g_hMenuFont) {
+            int count = GetMenuItemCount(hMenu);
+            RECT rcLast = {};
+            MENUBARINFO mbi = { sizeof(mbi) };
+            if (count > 0
+                && GetMenuItemRect(hwnd, hMenu, count - 1, &rcLast)
+                && GetMenuBarInfo(hwnd, OBJID_MENU, 0, &mbi))
+            {
+                RECT rcWin; GetWindowRect(hwnd, &rcWin);
+                RECT rcFill;
+                rcFill.left   = rcLast.right  - rcWin.left;
+                rcFill.right  = mbi.rcBar.right - rcWin.left;
+                rcFill.top    = mbi.rcBar.top   - rcWin.top;
+                rcFill.bottom = mbi.rcBar.bottom - rcWin.top;
+                if (rcFill.left < rcFill.right) {
+                    HDC hdc = GetWindowDC(hwnd);
+                    if (hdc) {
+                        HBRUSH hbr = CreateSolidBrush(RGB(255, 255, 255));
+                        FillRect(hdc, &rcFill, hbr);
+                        DeleteObject(hbr);
+                        ReleaseDC(hwnd, hdc);
+                    }
+                }
+            }
+        }
+        return lr;
     }
 
     // ── Background colours ────────────────────────────────────────────────────
@@ -2641,6 +5584,8 @@ static LRESULT CALLBACK Ne_WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
 
     // ── WM_DESTROY ────────────────────────────────────────────────────────────
     case WM_DESTROY: {
+        // Detach custom scrollbars before NeTabs_Destroy destroys the edit HWNDs
+        Ne_DetachAllScrollbars();
         NeTabs_Destroy(hwnd);
 
         if (g_hMenuFont) { DeleteObject(g_hMenuFont); g_hMenuFont = NULL; }
@@ -2730,6 +5675,10 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR lpCmdLine, int nCmdShow)
 
     MSG msg;
     while (GetMessageW(&msg, NULL, 0, 0)) {
+        // Route keyboard messages to the modeless Find/Replace dialog first.
+        if (s_hwndFind && IsWindow(s_hwndFind) && IsDialogMessageW(s_hwndFind, &msg))
+            continue;
+
         // Intercept Ctrl+N/O/S/Shift+S before the RichEdit consumes them.
         if (msg.message == WM_KEYDOWN && (GetKeyState(VK_CONTROL) & 0x8000)) {
             bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
@@ -2761,11 +5710,12 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR lpCmdLine, int nCmdShow)
                 }
                 continue;
             }
-            // Ctrl+B/I/U for text formatting (only when editor has focus).
+            // Ctrl+B/I/U/F for text formatting / find (only when editor has focus).
             if (GetFocus() == NeTabs_GetActiveEdit(s_hwndMain)) {
                 if (msg.wParam == 'B') { SendMessageW(s_hwndMain, WM_COMMAND, IDC_NE_BOLD,      0); continue; }
                 if (msg.wParam == 'I') { SendMessageW(s_hwndMain, WM_COMMAND, IDC_NE_ITALIC,    0); continue; }
                 if (msg.wParam == 'U') { SendMessageW(s_hwndMain, WM_COMMAND, IDC_NE_UNDERLINE, 0); continue; }
+                if (msg.wParam == 'F') { SendMessageW(s_hwndMain, WM_COMMAND, IDC_NE_FIND,      0); continue; }
             }
         }
         // F1 → Keyboard Shortcuts dialog

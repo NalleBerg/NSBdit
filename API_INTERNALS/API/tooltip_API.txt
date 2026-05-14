@@ -14,9 +14,9 @@ black.
 
 FILES:
 ------
-- tooltip.h    : Header file with API declarations
-- tooltip.cpp  : Implementation file
-- Include these in your project and link tooltip.cpp
+- tooltip/tooltip.h    : Header file with API declarations
+- tooltip/tooltip.cpp  : Implementation file
+- Include these in your project and link tooltip/tooltip.cpp
 
 ================================================================================
 API REFERENCE:
@@ -117,9 +117,9 @@ API REFERENCE:
       POINT pt = { rcButton.left, rcButton.bottom + 5 };
       
       std::vector<TooltipEntry> entries = {
-          { L"[GB] ", L"About SetupCraft" },
-          { L"[DE] ", L"Über SetupCraft" },
-          { L"[FR] ", L"À propos de SetupCraft" }
+          { L"[GB] ", L"About NSBEdit" },
+          { L"[DE] ", L"Über NSBEdit" },
+          { L"[FR] ", L"À propos de NSBEdit" }
       };
       ShowMultilingualTooltip(entries, pt.x, pt.y, hwndMain);
 
@@ -198,8 +198,8 @@ API REFERENCE:
    subclassing pattern to show/hide the tooltip, sizing rules, and examples.
 
    Files provided in this repo (already implemented):
-   - `tooltip.h`  - API declarations
-   - `tooltip.cpp` - Implementation you can reuse (InitTooltipSystem, Show/Hide)
+   - `tooltip/tooltip.h`  - API declarations
+   - `tooltip/tooltip.cpp` - Implementation you can reuse (InitTooltipSystem, Show/Hide)
 
    1) Initialization
    -----------------
@@ -457,7 +457,7 @@ API REFERENCE:
    timer-callback-only pattern.
 
    If the control is ENABLED, continue below:
-   - Include `tooltip.h` and `tooltip.cpp` in your project.
+   - Include `tooltip/tooltip.h` and `tooltip/tooltip.cpp` in your project.
    - Call `InitTooltipSystem(hInstance)` during window creation.
    - Create the hover `STATIC` icon with `SS_NOTIFY | SS_CENTERIMAGE`.
    - Subclass the icon with the provided pattern (see section 11).

@@ -16,6 +16,8 @@ struct NeTabDoc {
     bool hasDiskStamp = false;
     FILETIME diskWriteTime = {};
     ULONGLONG diskFileSize = 0;
+    int encoding = 0; // NeEncoding cast to int; 0 = Unknown
+    std::wstring prevPlainPath; // set when converting plain→RTF; cleared after save
 };
 
 struct NeTabsCreateParams {

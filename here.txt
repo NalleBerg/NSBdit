@@ -16,11 +16,12 @@ WHAT THE APP IS
 ---------------
 NSBEdit is a standalone Win32 RTF notepad with a full formatting toolbar and status bar.
 It is written in a single C++ source file (NSBEdit.cpp) plus a tiny header (NSBEdit.h).
-It shares two source files with the parent SetupCraft project: dpi.cpp / dpi.h and tooltip.cpp / tooltip.h.
+It shares two source files with the parent SetupCraft project: dpi.cpp / dpi.h and tooltip/tooltip.cpp / tooltip/tooltip.h.
 After the move those files must either be:
   (a) copied into the new folder and the #include paths updated from "../dpi.h" to "dpi.h", OR
   (b) kept at a relative path — but that only works if the workspace layout is the same.
 Option (a) is cleaner for a standalone repo.
+Shared tools live in subfolders: tooltip/ for the tooltip module, scroll/ for the custom scrollbar module.
 
 
 FILES IN THIS FOLDER AND WHAT THEY ARE
