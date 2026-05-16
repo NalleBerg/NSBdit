@@ -89,7 +89,13 @@ static void NeTabs_ShowHoverTip(int idx)
     POINT p = { ir.left, ir.bottom + S(2) };
     ClientToScreen(g_tabs.hTab, &p);
 
-    std::wstring txt = g_tabs.docs[idx].path.empty() ? g_tabs.untitled : g_tabs.docs[idx].path;
+    std::wstring txt;
+    const NeTabDoc& doc = g_tabs.docs[idx];
+    if (doc.isFtpFile && !doc.ftpRemotePath.empty()) {
+        txt = doc.ftpFriendlyName + L" \u2014 " + doc.ftpRemotePath;
+    } else {
+        txt = doc.path.empty() ? g_tabs.untitled : doc.path;
+    }
     std::vector<TooltipEntry> entries = { {L"", txt.c_str()} };
     ShowMultilingualTooltip(entries, p.x, p.y, g_tabs.hwndParent);
     g_tipIndex = idx;

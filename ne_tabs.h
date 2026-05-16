@@ -3,6 +3,7 @@
 #include <windows.h>
 #include <commctrl.h>
 #include <string>
+#include <cstdint>
 
 // Parent-notification messages posted by the tab module.
 #define NE_WM_TABCLOSE (WM_APP + 201)   // wParam = tab index to close
@@ -19,9 +20,15 @@ struct NeTabDoc {
     int encoding = 0; // NeEncoding cast to int; 0 = Unknown
     std::wstring prevPlainPath; // set when converting plain→RTF; cleared after save
     HWND hSci = NULL;       // Scintilla editor (NULL = use hEdit/RichEdit)
+    HWND hLineGutter = NULL;// companion line-number panel for the RichEdit side
     int  langId = -1;       // index into s_langs[] in NSBEdit.cpp
     bool langUserSet = false; // user manually overrode auto-detect
     bool lineNumsVisible = true; // whether the line-number margin is shown
+    // ── FTP/SFTP remote editing ───────────────────────────────────────────────
+    bool         isFtpFile          = false; // file was opened from an FTP/SFTP server
+    int64_t      ftpProfileId       = -1;    // NeProfile::id of the active server
+    std::wstring ftpRemotePath;              // absolute path on the server
+    std::wstring ftpFriendlyName;            // display name of the server (for tooltip)
 };
 
 struct NeTabsCreateParams {

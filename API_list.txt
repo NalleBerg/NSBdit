@@ -92,7 +92,22 @@
                                                 Ne_LoadLocale(). Tooltip subclass:
                                                 Ne_SetTip/Ne_TipSubclassProc.
                                                 Control ID range: 201–230.
-                                                IDM range: 107–117.
+                                                IDM range: 107–133.
+                                                Ne_ApplyLang(hSci, langIdx) — sends
+                                                SCI_SETKEYWORDS from s_langKws[] and
+                                                applies per-lexer style overrides (e.g.
+                                                SCE_HPHP_* 118–127 for phpscript).
+                                                Language menu on RichEdit tab converts
+                                                tab to Scintilla on demand (plain text
+                                                extracted, Scintilla created, RichEdit
+                                                hidden). AltGr fix: Ctrl-shortcut loop
+                                                skips when VK_RMENU held so AltGr+0/7
+                                                etc. reach the editor.
+                                                IDM_SAVE_TO_FTP (133): File > Save to
+                                                FTP... — saves active doc to temp file,
+                                                opens Ne_ShowFtpBrowserSave, uploads via
+                                                NeFtp_Upload, marks tab FTP-linked,
+                                                keeps connection open.
 
   ne_tabs.h / ne_tabs.cpp                       Tabbed editor module — SysTabControl32
                                                 strip + per-tab RichEdit HWND ownership.
@@ -157,6 +172,17 @@
                                                 ne_tabs.h/.cpp integration, close-zone
                                                 behavior, per-tab editor state, and
                                                 toolbar/status synchronization semantics.
+
+  API_INTERNALS\INTERNALS\line_number_INTERNALS.txt
+                                                Line-number display architecture — dual-editor
+                                                design (Scintilla built-in margin vs RichEdit
+                                                NsbLineGutter custom child window), toggle flow
+                                                (s_lineNumsOn → Ne_SyncLineNumBtn →
+                                                Ne_SyncRichGutters), gutter WndProc paint rules
+                                                (◂ drawn last to stay on top of numbers),
+                                                file-load synchronisation (Ne_SyncRichGutters
+                                                must be called after both RTF and non-RTF load
+                                                paths), and bug history.
 
   API_INTERNALS\API\spinner_dialog_API.txt      Modal progress/spinner dialog component — API,
                                                 thread usage, and progress callback protocol.

@@ -1,6 +1,6 @@
 # NSBEdit
 
-A lightweight, standalone RTF notepad for Windows. **v2026.05.15.12**
+A lightweight, standalone RTF notepad for Windows. **v2026.05.16.09**
 
 ## Download
 
@@ -37,6 +37,8 @@ Just grab **[NSBEdit.exe](NSBEdit.exe)** — no installer, no extra files, no de
 - DPI-aware (PerMonitorV2), statically linked — no external DLLs beyond Windows system ones
 - Hover tooltips on all toolbar controls
 - Credits dialog (About → Credits): Scintilla, Lexilla, GDI+, MinGW-W64 sections with links
+- **Syntax highlighting** — 25 languages (PHP, Python, C/C++, JavaScript, HTML, CSS, SQL, and more); choose via Language menu. Selecting a language on a plain-text tab instantly converts it to the Scintilla code editor with full colour coding
+- **Save to FTP** (File → Save to FTP…) — upload the active document to any connected FTP server; browse the remote tree, enter a filename, click Save here. Connection stays open after upload
 
 ## Building from source
 

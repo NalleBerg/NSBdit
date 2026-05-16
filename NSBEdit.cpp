@@ -1,4 +1,4 @@
-// NSBEdit — standalone RTF notepad
+﻿// NSBEdit — standalone RTF notepad
 // Full-featured RTF editor window with File menu, toolbar, and status bar.
 // Icon: shell32.dll index 70  (set on taskbar, title bar, and status bar).
 // Tooltips: English-only via project tooltip system.
@@ -28,6 +28,9 @@
 #include "scroll/my_scrollbar_hscroll.h"
 #include "highlight/highlight.h"
 #include "checkbox.h"
+#include "ne_crypto.h"
+#include "ne_profiles.h"
+#include "ne_ftp.h"
 // Scintilla + Lexilla (statically linked)
 #include "ILexer.h"
 #include "Scintilla.h"
@@ -104,7 +107,12 @@ enum class NeEncoding {
 #define IDM_TABLE_PROPS     127   // Table properties (menu/button)
 #define IDM_CTX_TABLE_PROPS 128   // Context-menu "Table properties"
 #define IDM_CTX_HRULE_PROPS 129   // Context-menu "Horizontal Rule Properties"
+#define IDM_FTP_ADD_SITE    130   // FTP menu: "Add site..."
+#define IDM_FTP_DISCONNECT  131   // FTP menu: "Disconnect"
+#define IDM_FTP_BROWSE      132   // FTP menu: "Browse files..."
+#define IDM_SAVE_TO_FTP     133   // File menu: "Save to FTP..."
 #define IDM_LANG_BASE       600   // Language menu: 600..600+NE_LANG_COUNT-1
+#define IDM_FTP_CONNECT_BASE 700  // FTP menu: profile entries 700..799
 #define IDC_NE_CLEARFMT     227
 #define IDC_NE_PRINT_BTN    228
 #define IDC_NE_ZOOM         229
@@ -187,6 +195,9 @@ struct NeState {
     int   tabY            = 0;
     int   tabH            = 0;
     int   editY           = 0;
+    int   editX           = 0;
+    int   editW           = 0;
+    int   editH           = 0;
     int   statusH         = 0;
     int   pad             = 0;
     int   minClientW      = 0;  // minimum client width enforced by WM_GETMINMAXINFO
@@ -219,7 +230,7 @@ static const NeLang s_langs[] = {
     { L"Markdown",     "markdown",    L"md|markdown"              },
     { L"Pascal",       "pascal",      L"pas|pp|dpr|lpr"           },
     { L"Perl",         "perl",        L"pl|pm|pod"                },
-    { L"PHP",          "hypertext",   L"php|php3|php4|php5|phtml" },
+    { L"PHP",          "phpscript",   L"php|php3|php4|php5|phtml" },
     { L"PowerShell",   "powershell",  L"ps1|psm1|psd1"            },
     { L"Python",       "python",      L"py|pyw|pyi"               },
     { L"Ruby",         "ruby",        L"rb|rbw|gemspec"           },
@@ -234,6 +245,10 @@ static const int NE_LANG_COUNT = (int)(sizeof(s_langs) / sizeof(s_langs[0]));
 
 // Menu handle for the Language popup (so we can update checkmarks).
 static HMENU s_hLangMenu = NULL;
+static HMENU s_hFtpMenu  = NULL;
+// Forward declaration — defined near WM_CREATE.
+static HFONT g_hMenuFont;
+static bool  s_lineNumsOn = false; // persists across tabs; toggled by gutter click
 
 // Returns the language index matching the given lowercase extension, or 0 (Plain Text).
 static int Ne_LangFromExt(const std::wstring& path)
@@ -301,18 +316,22 @@ static void Ne_SetupScintillaStyle(HWND hSci)
     sci(SCI_SETTABWIDTH, 4, 0);
     // Line number margin (margin 0)
     sci(SCI_SETMARGINTYPEN,  0, SC_MARGIN_NUMBER);
-    sci(SCI_SETMARGINWIDTHN, 0, S(44));
+    sci(SCI_SETMARGINWIDTHN, 0, s_lineNumsOn ? S(44) : 0);
     sci(SCI_STYLESETBACK, STYLE_LINENUMBER, RGB(240,240,240));
     sci(SCI_STYLESETFORE, STYLE_LINENUMBER, RGB(100,100,100));
     sci(SCI_STYLESETSIZE, STYLE_LINENUMBER, 8);
     sci(SCI_STYLESETFONT, STYLE_LINENUMBER, (LPARAM)"Consolas");
+    // Autocomplete settings
+    sci(SCI_AUTOCSETIGNORECASE, TRUE, 0);
+    sci(SCI_AUTOCSETAUTOHIDE,   TRUE, 0);
+    sci(SCI_AUTOCSETDROPRESTOFWORD, FALSE, 0);
 }
 
 // Assign a Lexilla lexer (by name) to a Scintilla window.
 static void Ne_SetScintillaLexer(HWND hSci, const char* lexerName)
 {
     if (!lexerName) {
-        SendMessageW(hSci, SCI_SETILEXER, 0, 0); // null = plain text
+        SendMessageW(hSci, SCI_SETILEXER, 0, 0);
         return;
     }
     ILexer5* pLex = CreateLexer(lexerName);
@@ -320,8 +339,275 @@ static void Ne_SetScintillaLexer(HWND hSci, const char* lexerName)
         SendMessageW(hSci, SCI_SETILEXER, 0, (LPARAM)pLex);
 }
 
-// Forward declaration so Ne_SyncLineNumBtn can be called from anywhere.
-static void Ne_SyncLineNumBtn(HWND hwnd);
+// Forward declaration — defined after s_langKws[].
+static void Ne_ApplyLang(HWND hSci, int langIdx);
+
+// ── RichEdit line-number gutter ───────────────────────────────────────────────
+// NsbLineGutter is a plain child window painted to show line numbers next to a
+// RichEdit control.  The associated RichEdit HWND is stored in GWLP_USERDATA.
+
+static LRESULT CALLBACK NsbLineGutterProc(HWND hWnd, UINT msg,
+                                          WPARAM wParam, LPARAM lParam)
+{
+    switch (msg) {
+    case WM_ERASEBKGND:
+        return 1;
+
+    case WM_MOUSEWHEEL:
+    case WM_MOUSEHWHEEL: {
+        HWND hEdit = (HWND)GetWindowLongPtrW(hWnd, GWLP_USERDATA);
+        if (hEdit) SendMessageW(hEdit, msg, wParam, lParam);
+        return 0;
+    }
+
+    case WM_SETCURSOR: {
+        POINT pt; GetCursorPos(&pt); ScreenToClient(hWnd, &pt);
+        RECT rc; GetClientRect(hWnd, &rc);
+        bool thinStrip = (rc.right <= S(24));  // thin strip = fully clickable
+        bool inBtn = true;
+        if (!thinStrip) {  // full gutter: only top-left ◂ area is clickable
+            int btnSz = S(18);
+            RECT btnRc = { S(1), 0, S(1) + btnSz, btnSz };
+            POINT mpt = { pt.x, pt.y };
+            inBtn = (PtInRect(&btnRc, mpt) != FALSE);
+        }
+        SetCursor(LoadCursorW(NULL, inBtn ? IDC_HAND : IDC_ARROW));
+        return TRUE;
+    }
+
+    case WM_MOUSEMOVE: {
+        HWND hTip = (HWND)GetPropW(hWnd, L"hTip");
+        if (hTip) {
+            MSG relayMsg = { hWnd, msg, wParam, lParam };
+            SendMessageW(hTip, TTM_RELAYEVENT, 0, (LPARAM)&relayMsg);
+        }
+        if (!GetPropW(hWnd, L"hover")) {
+            SetPropW(hWnd, L"hover", (HANDLE)1);
+            InvalidateRect(hWnd, NULL, FALSE);
+            TRACKMOUSEEVENT tme = { sizeof(tme), TME_LEAVE, hWnd, 0 };
+            TrackMouseEvent(&tme);
+        }
+        return 0;
+    }
+
+    case WM_MOUSELEAVE: {
+        HWND hTip = (HWND)GetPropW(hWnd, L"hTip");
+        if (hTip) {
+            MSG relayMsg = { hWnd, msg, wParam, lParam };
+            SendMessageW(hTip, TTM_RELAYEVENT, 0, (LPARAM)&relayMsg);
+        }
+        RemovePropW(hWnd, L"hover");
+        InvalidateRect(hWnd, NULL, FALSE);
+        return 0;
+    }
+
+    case WM_LBUTTONDOWN: {
+        int mx = GET_X_LPARAM(lParam), my = GET_Y_LPARAM(lParam);
+        RECT rc; GetClientRect(hWnd, &rc);
+        bool thinStrip = (rc.right <= S(24));
+        bool inBtn = true;
+        if (!thinStrip) {  // full gutter: only top-left ◂ area is clickable
+            int btnSz = S(18);
+            RECT btnRc = { S(1), 0, S(1) + btnSz, btnSz };
+            POINT pt = { mx, my };
+            inBtn = (PtInRect(&btnRc, pt) != FALSE);
+        }
+        if (inBtn)
+            PostMessageW(GetParent(hWnd), WM_COMMAND,
+                         MAKEWPARAM(IDC_BTN_LINENUM, BN_CLICKED), 0);
+        return 0;
+    }
+
+    case WM_PAINT: {
+        HWND hEdit = (HWND)GetWindowLongPtrW(hWnd, GWLP_USERDATA);
+        PAINTSTRUCT ps;
+        HDC hdc = BeginPaint(hWnd, &ps);
+        RECT rc; GetClientRect(hWnd, &rc);
+        bool hover = (GetPropW(hWnd, L"hover") != NULL);
+        int btnSz = S(18);
+
+        // Background
+        HBRUSH hbr = CreateSolidBrush(RGB(240, 240, 240));
+        FillRect(hdc, &rc, hbr);
+        DeleteObject(hbr);
+
+        HFONT hf = g_hMenuFont;
+        HFONT hOldFont = hf ? (HFONT)SelectObject(hdc, hf) : NULL;
+        SetBkMode(hdc, TRANSPARENT);
+
+        // Thin strip: width <= S(24) means either numbers-off OR a Scintilla tab.
+        // In both cases just show ▸ (off) or ◂ (on) — no line numbers drawn here.
+        bool thinStrip = (rc.right <= S(24));
+
+        if (thinStrip) {
+            if (hover) {
+                HBRUSH hHov = CreateSolidBrush(RGB(210, 230, 245));
+                FillRect(hdc, &rc, hHov);
+                DeleteObject(hHov);
+            }
+            const wchar_t* glyph = s_lineNumsOn ? L"\u25C2" : L"\u25B8";
+            RECT rcBtn = { 0, S(2), rc.right, S(2) + btnSz };
+            SetTextColor(hdc, RGB(60, 100, 140));
+            DrawTextW(hdc, glyph, -1, &rcBtn,
+                      DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOCLIP);
+        } else {
+            // Full gutter (RichEdit, numbers ON): separator + numbers + ◂ header
+            HPEN hpen = CreatePen(PS_SOLID, 1, RGB(200, 200, 200));
+            HPEN hOldPen = (HPEN)SelectObject(hdc, hpen);
+            MoveToEx(hdc, rc.right - 1, rc.top, NULL);
+            LineTo(hdc, rc.right - 1, rc.bottom);
+            SelectObject(hdc, hOldPen);
+            DeleteObject(hpen);
+
+            // Line numbers — right-aligned
+            if (hEdit) {
+                SetTextColor(hdc, RGB(100, 100, 100));
+                int firstLine  = (int)SendMessageW(hEdit, EM_GETFIRSTVISIBLELINE, 0, 0);
+                int totalLines = (int)SendMessageW(hEdit, EM_GETLINECOUNT,        0, 0);
+                for (int ln = firstLine; ln < totalLines; ++ln) {
+                    int charIdx = (int)SendMessageW(hEdit, EM_LINEINDEX, ln, 0);
+                    if (charIdx < 0) break;
+                    POINTL pt = {};
+                    SendMessageW(hEdit, EM_POSFROMCHAR, (WPARAM)&pt, (LPARAM)charIdx);
+                    int y = (int)pt.y;
+                    if (y >= rc.bottom) break;
+                    if (y < 0) continue;
+                    wchar_t num[16];
+                    swprintf_s(num, L"%d", ln + 1);
+                    RECT rcNum = { 0, y, rc.right - S(4), y + S(20) };
+                    DrawTextW(hdc, num, -1, &rcNum,
+                              DT_RIGHT | DT_SINGLELINE | DT_TOP | DT_NOCLIP);
+                }
+            }
+
+            // ◂ drawn last — always on top of the numbers
+            RECT btnRc = { S(1), 0, S(1) + btnSz, btnSz };
+            if (hover) {
+                POINT mpt; GetCursorPos(&mpt); ScreenToClient(hWnd, &mpt);
+                if (PtInRect(&btnRc, mpt)) {
+                    HBRUSH hHov = CreateSolidBrush(RGB(210, 230, 245));
+                    FillRect(hdc, &btnRc, hHov);
+                    DeleteObject(hHov);
+                }
+            }
+            SetTextColor(hdc, RGB(60, 100, 140));
+            DrawTextW(hdc, L"\u25C2", -1, &btnRc,
+                      DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOCLIP);
+        }
+        if (hOldFont) SelectObject(hdc, hOldFont);
+        EndPaint(hWnd, &ps);
+        return 0;
+    }
+    }
+    return DefWindowProcW(hWnd, msg, wParam, lParam);
+}
+
+// Create the gutter for a RichEdit doc if not yet created.
+static void Ne_EnsureLineGutter(HWND hwndParent, NeTabDoc* d)
+{
+    if (!d || !d->hEdit || d->hLineGutter) return;
+    d->hLineGutter = CreateWindowExW(0, L"NsbLineGutter", L"",
+        WS_CHILD | WS_CLIPSIBLINGS,
+        0, 0, 1, 1,
+        hwndParent, NULL, GetModuleHandleW(NULL), NULL);
+    if (!d->hLineGutter) return;
+    SetWindowLongPtrW(d->hLineGutter, GWLP_USERDATA, (LONG_PTR)d->hEdit);
+
+    // Attach a tooltip for the toggle button
+    HWND hTip = CreateWindowExW(0, TOOLTIPS_CLASS, NULL,
+        WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX,
+        CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT,
+        d->hLineGutter, NULL, GetModuleHandleW(NULL), NULL);
+    if (hTip) {
+        SetWindowPos(hTip, HWND_TOPMOST, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        TOOLINFOW ti = {};
+        ti.cbSize   = sizeof(ti);
+        ti.uFlags   = TTF_SUBCLASS;
+        ti.hwnd     = d->hLineGutter;
+        ti.uId      = 1;
+        ti.rect     = { 0, 0, 9999, 9999 };
+        ti.lpszText = const_cast<LPWSTR>(
+            s_lineNumsOn ? L"Hide line numbers" : L"Show line numbers");
+        SendMessageW(hTip, TTM_ADDTOOL, 0, (LPARAM)&ti);
+        SetPropW(d->hLineGutter, L"hTip", (HANDLE)hTip);
+    }
+}
+
+// Reposition all gutters and shrink editor windows to make room.
+// The gutter is always visible (as a thin strip) for both RichEdit and Scintilla tabs.
+// Must be called after NeTabs_SetRects so the base edit rect is current.
+static void Ne_SyncRichGutters(HWND hwnd)
+{
+    NeState* st = (NeState*)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+    if (!st) return;
+    int ex = st->editX, ey = st->editY, ew = st->editW, eh = st->editH;
+    if (ew <= 0 || eh <= 0) return;
+
+    int n = NeTabs_GetCount(hwnd);
+    for (int i = 0; i < n; ++i) {
+        NeTabDoc* d = NeTabs_GetDocByIndex(hwnd, i);
+        if (!d || !d->hEdit) continue;
+        Ne_EnsureLineGutter(hwnd, d);
+
+        bool editVis = (IsWindowVisible(d->hEdit) != FALSE);
+        bool sciVis  = (d->hSci && IsWindowVisible(d->hSci) != FALSE);
+        bool vis     = editVis || sciVis;
+
+        // Gutter width:
+        //   Scintilla tab → always thin strip (S(20)); Scintilla draws its own numbers.
+        //   RichEdit tab  → S(44) when numbers on, S(20) when off.
+        int gutW = (sciVis || !s_lineNumsOn) ? S(20) : S(44);
+
+        if (d->hLineGutter) {
+            SetWindowPos(d->hLineGutter, HWND_TOP,
+                         ex, ey, gutW, std::max(1, eh),
+                         SWP_NOACTIVATE);
+            ShowWindow(d->hLineGutter, vis ? SW_SHOWNOACTIVATE : SW_HIDE);
+            if (vis) InvalidateRect(d->hLineGutter, NULL, TRUE);
+        }
+
+        int editLeft = ex + gutW;
+        int editW    = std::max(1, ew - gutW);
+
+        // Resize the visible editor (RichEdit or Scintilla) to sit beside the gutter.
+        if (editVis)
+            SetWindowPos(d->hEdit, NULL,
+                         editLeft, ey, editW, std::max(1, eh),
+                         SWP_NOZORDER | SWP_NOACTIVATE);
+        if (sciVis)
+            SetWindowPos(d->hSci, NULL,
+                         editLeft, ey, editW, std::max(1, eh),
+                         SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+}
+
+// Toggle line numbers on all open tabs and refresh all gutters.
+static void Ne_SyncLineNumBtn(HWND hwnd)
+{
+    const wchar_t* tipText =
+        s_lineNumsOn ? L"Hide line numbers" : L"Show line numbers";
+    int n = NeTabs_GetCount(hwnd);
+    for (int i = 0; i < n; ++i) {
+        NeTabDoc* d = NeTabs_GetDocByIndex(hwnd, i);
+        if (!d) continue;
+        if (d->hSci)
+            SendMessageW(d->hSci, SCI_SETMARGINWIDTHN, 0, s_lineNumsOn ? S(44) : 0);
+        if (d->hLineGutter) {
+            HWND hTip = (HWND)GetPropW(d->hLineGutter, L"hTip");
+            if (hTip) {
+                TOOLINFOW ti = {};
+                ti.cbSize   = sizeof(ti);
+                ti.hwnd     = d->hLineGutter;
+                ti.uId      = 1;
+                ti.lpszText = const_cast<LPWSTR>(tipText);
+                SendMessageW(hTip, TTM_UPDATETIPTEXT, 0, (LPARAM)&ti);
+            }
+            InvalidateRect(d->hLineGutter, NULL, FALSE);
+        }
+    }
+    Ne_SyncRichGutters(hwnd);
+}
 
 // Create and configure a Scintilla child window (hidden; caller shows it).
 static HWND Ne_CreateScintilla(HWND hwndParent, int x, int y, int w, int h)
@@ -350,6 +636,136 @@ static std::string Ne_SciGetText(HWND hSci)
     return buf;
 }
 
+// ── Keyword autocomplete ──────────────────────────────────────────────────────
+// Space-separated keyword lists, indexed by s_langs[] order.
+// Empty string = no autocomplete for that language.
+static const char* s_langKws[] = {
+    /* 0 Plain Text  */ "",
+    /* 1 Batch       */ "break call cd chdir cls color copy del dir do echo else endlocal errorlevel exit for goto if md mkdir move not pause pushd rem rd rmdir set setlocal shift start title type",
+    /* 2 C / C++     */ "alignas alignof auto bool break case catch char char16_t char32_t char8_t class concept const const_cast consteval constexpr constinit continue co_await co_return co_yield decltype default delete do double dynamic_cast else enum explicit export extern false final float for friend goto if inline int long mutable namespace new noexcept nullptr operator override private protected public reinterpret_cast requires return short signed sizeof static static_assert static_cast struct switch template this thread_local throw true try typedef typeid typename union unsigned using virtual void volatile wchar_t while",
+    /* 3 C#          */ "abstract as base bool break byte case catch char checked class const continue decimal default delegate do double else enum event explicit extern false finally fixed float for foreach goto if implicit in int interface internal is lock long namespace new null object operator out override params private protected public readonly ref return sbyte sealed short sizeof stackalloc static string struct switch this throw true try typeof uint ulong unchecked unsafe ushort using virtual void volatile while",
+    /* 4 CSS         */ "align-content align-items align-self animation background background-color background-image border border-radius bottom box-shadow color content display flex flex-direction float font font-family font-size font-weight gap grid height justify-content left letter-spacing line-height margin max-height max-width min-height min-width opacity overflow padding position right text-align text-decoration top transform transition visibility white-space width z-index",
+    /* 5 HTML        */ "a abbr address area article aside audio b base blockquote body br button canvas caption cite code col colgroup data datalist dd details dfn dialog div dl dt em embed fieldset figcaption figure footer form h1 h2 h3 h4 h5 h6 head header hr html i iframe img input ins kbd label legend li link main map mark menu meta meter nav noscript object ol optgroup option output p picture pre progress q rp rt ruby s samp script section select small source span strong style sub summary sup table tbody td template textarea tfoot th thead time title tr track u ul var video wbr",
+    /* 6 INI         */ "",
+    /* 7 Java        */ "abstract assert boolean break byte case catch char class const continue default do double else enum extends final finally float for goto if implements import instanceof int interface long native new null package private protected public return short static strictfp super switch synchronized this throw throws transient true try var void volatile while",
+    /* 8 JavaScript  */ "async await break case catch class const continue debugger default delete do else export extends false finally for from function get if import in instanceof let new null of return set static super switch this throw true try typeof undefined var void while with yield",
+    /* 9 JSON        */ "false null true",
+    /* 10 Lua        */ "and break do else elseif end false for function goto if in local nil not or repeat return then true until while",
+    /* 11 Makefile   */ "define else endef endif export ifdef ifndef ifeq ifneq include override private undefine unexport vpath",
+    /* 12 Markdown   */ "",
+    /* 13 Pascal     */ "and array as begin boolean break byte case char class const constructor continue default destructor div do downto else end except exit extended false file finalization finally for function goto if implementation in inherited initialization inline integer interface is label library longint mod nil not object of on or out overload override packed pointer procedure program property protected public published raise real record repeat result self set shortint shl shr single string then to true try type unit until uses var while with word xor",
+    /* 14 Perl       */ "chomp chop chr close connect delete die do each else elsif eval exit exists for foreach format goto if index join keys last length local map my next no our package pop print printf push q qq qr qw qx ref return reverse scalar shift sort splice split sprintf sub substr system tie tied undef unless until use values wantarray while",
+    /* 15 PHP        */ "abstract and array break callable case catch class clone const continue declare default die do echo else elseif empty enddeclare endfor endforeach endif endswitch endwhile extends final finally fn for foreach function global goto if implements include include_once instanceof insteadof interface isset list match namespace new null or print private protected public readonly require require_once return static switch throw trait try unset use var while xor yield",
+    /* 16 PowerShell */ "begin break catch class continue data define do dynamicparam else elseif end exit filter finally for foreach from function if in param process return switch throw trap try until using while",
+    /* 17 Python     */ "False None True and as assert async await break class continue def del elif else except finally for from global if import in is lambda match nonlocal not or pass raise return try while with yield",
+    /* 18 Ruby       */ "alias and begin break case class def defined do else elsif end ensure false for if in module next nil not or redo rescue retry return self super then true undef unless until when while yield",
+    /* 19 Rust       */ "as async await break const continue crate dyn else enum extern false fn for if impl in let loop match mod move mut pub ref return self static struct super trait true type union unsafe use where while",
+    /* 20 SQL        */ "add all alter and any as asc authorization backup begin between break by cascade case check close clustered coalesce column commit constraint contains continue convert create cross current cursor database declare default delete deny desc distinct do drop else end exec execute exists exit fetch for foreign from full function goto grant group having identity if index inner insert intersect into is join key left like load merge national not null nullif of off on open option or order outer over percent pivot primary print proc procedure public raiserror read reconfigure references replication restore return revoke right rollback rowcount rule save schema select set statistics table then to top tran transaction trigger truncate union unique unpivot update use user values view when where while with",
+    /* 21 TypeScript */ "abstract any as async at await boolean break case catch class const constructor continue debugger declare default delete do else enum export extends false finally for from function get if implements import in infer instanceof interface is keyof let module namespace never new null number object of out override private protected public readonly return set static string super switch symbol this throw true try type typeof undefined unique unknown var void while with yield",
+    /* 22 VBScript   */ "and as boolean byref byval call case class const date dim do each else elseif empty end enum erase error event exit explicit false for function get if imp in is let like loop me mod new next not nothing null object on option or preserve private property public randomize redim rem resume select set step string sub then to true type until wend while with",
+    /* 23 XML        */ "",
+    /* 24 YAML       */ "false null true",
+};
+static_assert(sizeof(s_langKws)/sizeof(s_langKws[0]) == NE_LANG_COUNT,
+              "s_langKws length must match NE_LANG_COUNT");
+
+// Apply lexer + keywords + per-lexer style colours to a Scintilla window.
+static void Ne_ApplyLang(HWND hSci, int langIdx)
+{
+    if (langIdx < 0 || langIdx >= NE_LANG_COUNT) {
+        SendMessageW(hSci, SCI_SETILEXER, 0, 0);
+        return;
+    }
+    const char* lexerName = s_langs[langIdx].lexer;
+    Ne_SetScintillaLexer(hSci, lexerName);
+
+    // Send keyword list so the lexer colours keywords.
+    const char* kws = s_langKws[langIdx];
+    if (kws && *kws)
+        SendMessageA(hSci, SCI_SETKEYWORDS, 0, (LPARAM)kws);
+
+    if (!lexerName) return;
+    auto sc = [hSci](UINT m, WPARAM w, LPARAM l){ SendMessageW(hSci, m, w, l); };
+
+    if (strcmp(lexerName, "phpscript") == 0) {
+        // SCE_HPHP_*: 118=default 119=dqstring 120=sqstring 121=keyword
+        //             122=number  123=$variable 124=/*comment*/ 125=//comment
+        //             126=${var}-in-string  127=operator
+        sc(SCI_STYLESETFORE, 119, RGB(163,21,21));
+        sc(SCI_STYLESETFORE, 120, RGB(163,21,21));
+        sc(SCI_STYLESETFORE, 121, RGB(0,0,200));   sc(SCI_STYLESETBOLD, 121, TRUE);
+        sc(SCI_STYLESETFORE, 122, RGB(9,136,90));
+        sc(SCI_STYLESETFORE, 123, RGB(128,0,128));
+        sc(SCI_STYLESETFORE, 124, RGB(0,128,0));   sc(SCI_STYLESETITALIC, 124, TRUE);
+        sc(SCI_STYLESETFORE, 125, RGB(0,128,0));   sc(SCI_STYLESETITALIC, 125, TRUE);
+        sc(SCI_STYLESETFORE, 126, RGB(163,21,21));
+    } else if (strcmp(lexerName, "hypertext") == 0) {
+        // SCE_H_*: 1=tag 2=unknowntag 3=attr 4=unknownattr 5=number
+        //          6=dqstring 7=sqstring 9=comment 10=entity
+        sc(SCI_STYLESETFORE, 1,  RGB(86,156,214));
+        sc(SCI_STYLESETFORE, 2,  RGB(86,156,214));
+        sc(SCI_STYLESETFORE, 3,  RGB(156,220,254));
+        sc(SCI_STYLESETFORE, 4,  RGB(156,220,254));
+        sc(SCI_STYLESETFORE, 5,  RGB(9,136,90));
+        sc(SCI_STYLESETFORE, 6,  RGB(163,21,21));
+        sc(SCI_STYLESETFORE, 7,  RGB(163,21,21));
+        sc(SCI_STYLESETFORE, 9,  RGB(0,128,0));  sc(SCI_STYLESETITALIC, 9, TRUE);
+        sc(SCI_STYLESETFORE, 10, RGB(163,100,0));
+    }
+}
+
+// Show Scintilla keyword autocomplete for the current word prefix.
+static void Ne_SciAutoComplete(HWND hSci, int langIdx)
+{
+    if (langIdx < 0 || langIdx >= NE_LANG_COUNT) return;
+    const char* kws = s_langKws[langIdx];
+    if (!kws || !*kws) return;
+
+    Sci_Position pos       = (Sci_Position)SendMessageW(hSci, SCI_GETCURRENTPOS,      0,    0);
+    Sci_Position wordStart = (Sci_Position)SendMessageW(hSci, SCI_WORDSTARTPOSITION, (WPARAM)pos, TRUE);
+    int prefixLen = (int)(pos - wordStart);
+    if (prefixLen < 2) { SendMessageW(hSci, SCI_AUTOCCANCEL, 0, 0); return; }
+
+    // Extract the typed prefix
+    std::string prefix(prefixLen + 1, '\0');
+    Sci_TextRange tr{};
+    tr.chrg.cpMin = (Sci_PositionCR)wordStart;
+    tr.chrg.cpMax = (Sci_PositionCR)pos;
+    tr.lpstrText  = prefix.data();
+    SendMessageW(hSci, SCI_GETTEXTRANGE, 0, (LPARAM)&tr);
+    prefix.resize(prefixLen);
+
+    // Collect keywords that start with the typed prefix
+    std::vector<std::string> matches;
+    const char* p = kws;
+    while (*p) {
+        while (*p == ' ') ++p;
+        const char* end = p;
+        while (*end && *end != ' ') ++end;
+        if (end > p) {
+            size_t kwLen = (size_t)(end - p);
+            if (kwLen >= (size_t)prefixLen &&
+                _strnicmp(p, prefix.c_str(), (size_t)prefixLen) == 0)
+                matches.emplace_back(p, kwLen);
+        }
+        p = end;
+    }
+    if (matches.empty()) { SendMessageW(hSci, SCI_AUTOCCANCEL, 0, 0); return; }
+
+    // Dismiss if the only match is the exact word already typed
+    if (matches.size() == 1 && _stricmp(matches[0].c_str(), prefix.c_str()) == 0) {
+        SendMessageW(hSci, SCI_AUTOCCANCEL, 0, 0); return;
+    }
+
+    std::sort(matches.begin(), matches.end(),
+        [](const std::string& a, const std::string& b){ return _stricmp(a.c_str(), b.c_str()) < 0; });
+
+    std::string list;
+    for (auto& m : matches) { if (!list.empty()) list += ' '; list += m; }
+
+    SendMessageW(hSci, SCI_AUTOCSHOW, (WPARAM)prefixLen, (LPARAM)list.c_str());
+}
+
 // Update the Language menu checkmarks to reflect the active tab's langId.
 static void Ne_UpdateLangMenuCheck(int langId)
 {
@@ -367,19 +783,21 @@ static void Ne_UpdateLangMenuCheck(int langId)
 }
 
 // ── Owner-draw menu support ───────────────────────────────────────────────────
-static HFONT g_hMenuFont = NULL;
+// g_hMenuFont declared near top of file (needs to be visible to NsbLineGutterProc).
+static HICON g_hFtpMenuIcon = NULL;
 
 struct NeMenuItemData {
-    const wchar_t* text;
+    std::wstring   text;         // owned copy — never dangles
     bool           isSeparator;
     bool           isBar;
+    HICON          hSmallIcon;
 };
 static std::vector<NeMenuItemData*> g_menuItemStorage;
 
-static void Ne_AppendMenuOD(HMENU hMenu, UINT flags, UINT_PTR id, const wchar_t* text, bool isBar = false)
+static void Ne_AppendMenuOD(HMENU hMenu, UINT flags, UINT_PTR id, const wchar_t* text, bool isBar = false, HICON hIcon = NULL)
 {
     bool sep = (flags & MF_SEPARATOR) != 0;
-    NeMenuItemData* d = new NeMenuItemData{ text, sep, isBar };
+    NeMenuItemData* d = new NeMenuItemData{ text ? text : L"", sep, isBar, hIcon };
     g_menuItemStorage.push_back(d);
     AppendMenuW(hMenu, flags | MF_OWNERDRAW, id, (LPCWSTR)d);
 }
@@ -587,6 +1005,7 @@ static COLORREF Ne_BtnTextColor(int id)
     // View / misc
     case IDC_NE_WORDWRAP:    return RGB(0,   140, 105); // teal green
     case IDC_NE_CASE:        return RGB(105, 0,   165); // purple
+    case IDC_BTN_LINENUM:    return RGB(60,  120, 160); // steel blue
     default:                 return RGB(30,  30,  30);  // near-black
     }
 }
@@ -635,7 +1054,7 @@ static void Ne_EditHRuleProps(HWND hwnd, HWND hEdit);  // defined after Ne_ShowH
 static void Ne_RebuildHRList(HWND hEdit);              // defined near Ne_PaintHRules
 
 // ── Toggle word wrap (wrap to window ↔ no wrap) ───────────────────────────────
-static bool s_wordWrapOn = true;
+static bool s_wordWrapOn  = true;
 static void Ne_ToggleWordWrap(HWND hwnd, HWND hEdit)
 {
     s_wordWrapOn = !s_wordWrapOn;
@@ -858,6 +1277,65 @@ static void Ne_SyncToolbar(HWND hwnd, HWND hEdit)
     setCheck(IDC_NE_NUMBERED, pf.wNumbering == PFN_ARABIC);
 
     st->updatingToolbar = false;
+}
+
+// ── Zoom helpers ──────────────────────────────────────────────────────────────
+static int g_zoomRtf = 100; // RTF: percentage (50/75/100/125/150/200)
+static int g_zoomSci = 0;   // Scintilla: point offset (-10..+20)
+
+static const int s_zoomSteps[]   = { 50, 75, 100, 125, 150, 200 };
+static const int s_zoomStepCount = (int)(sizeof(s_zoomSteps)/sizeof(s_zoomSteps[0]));
+
+// Set the zoom combobox to the nearest preset step for RTF %.
+static void Ne_SyncZoomCombo(HWND hwnd, int pct)
+{
+    HWND hZ = GetDlgItem(hwnd, IDC_NE_ZOOM);
+    if (!hZ) return;
+    int best = 0, bestDiff = INT_MAX;
+    for (int i = 0; i < s_zoomStepCount; ++i) {
+        int d = abs(s_zoomSteps[i] - pct);
+        if (d < bestDiff) { bestDiff = d; best = i; }
+    }
+    SendMessageW(hZ, CB_SETCURSEL, (WPARAM)best, 0);
+}
+
+// Apply saved zoom to the given RTF or Scintilla window.
+static void Ne_ApplyZoomToDoc(NeTabDoc* doc)
+{
+    if (!doc) return;
+    if (doc->hSci) {
+        SendMessageW(doc->hSci, SCI_SETZOOM, (WPARAM)g_zoomSci, 0);
+    } else if (doc->hEdit) {
+        SendMessageW(doc->hEdit, EM_SETZOOM, (WPARAM)g_zoomRtf, 100);
+    }
+}
+
+// Step zoom up (+1), down (-1), or reset (0) for the active tab. Saves to DB.
+static void Ne_StepZoom(HWND hwnd, int dir)
+{
+    NeTabDoc* doc = NeTabs_GetActiveDoc(hwnd);
+    if (!doc) return;
+
+    if (doc->hSci) {
+        if      (dir > 0)  SendMessageW(doc->hSci, SCI_ZOOMIN,  0, 0);
+        else if (dir < 0)  SendMessageW(doc->hSci, SCI_ZOOMOUT, 0, 0);
+        else               SendMessageW(doc->hSci, SCI_SETZOOM, 0, 0);
+        g_zoomSci = (int)SendMessageW(doc->hSci, SCI_GETZOOM, 0, 0);
+        NeProfiles_SetIntSetting("zoom_sci", g_zoomSci);
+    } else if (doc->hEdit) {
+        // Find current step index, then move.
+        int cur = g_zoomRtf;
+        int idx = 2; // default = 100%
+        for (int i = 0; i < s_zoomStepCount; ++i)
+            if (s_zoomSteps[i] == cur) { idx = i; break; }
+        if      (dir > 0 && idx < s_zoomStepCount - 1) ++idx;
+        else if (dir < 0 && idx > 0)                   --idx;
+        else if (dir == 0)                              idx = 2; // 100%
+        g_zoomRtf = s_zoomSteps[idx];
+        SendMessageW(doc->hEdit, EM_SETZOOM, (WPARAM)g_zoomRtf, 100);
+        Ne_SyncZoomCombo(hwnd, g_zoomRtf);
+        NeProfiles_SetIntSetting("zoom_rtf", g_zoomRtf);
+    }
 }
 
 // ── Title and status bar ───────────────────────────────────────────────────────
@@ -1572,6 +2050,12 @@ static const ShortcutRow s_shortcuts[] = {
     { L"[Ctrl]+[Right]",       L"Word right",         L"Move cursor one word to the right" },
     { L"[Shift]+[Left/Right]", L"Extend selection",   L"Extend text selection one character" },
     { L"[Ctrl]+[Shift]+[Left/Right]", L"Select word", L"Extend selection one word at a time" },
+    // ── Zoom ──────────────────────────────────────────────────────────────────
+    { L"[Ctrl]+[+]",           L"Zoom in",            L"Increase zoom level" },
+    { L"[Ctrl]+[-]",           L"Zoom out",           L"Decrease zoom level" },
+    { L"[Ctrl]+0",             L"Reset zoom",         L"Reset zoom to 100% / default" },
+    { L"[Ctrl]+[Scroll Up]",   L"Zoom in",            L"Increase zoom level" },
+    { L"[Ctrl]+[Scroll Down]", L"Zoom out",           L"Decrease zoom level" },
     // ── Menu access (Alt mnemonics) ───────────────────────────────────────────
     { L"[Alt]+F, N",           L"New",                L"File menu \u2192 New" },
     { L"[Alt]+F, O",           L"Open",               L"File menu \u2192 Open" },
@@ -1826,7 +2310,7 @@ static void Ne_DoReplace(HWND dlg, bool all)
             re = std::wregex(needle, flags);
             return true;
         } catch (...) {
-            MessageBoxW(dlg, L"Invalid regular expression.", Ls(L"DLG_FIND"), MB_OK | MB_ICONERROR);
+            MessageBoxW(dlg, Ls(L"MSG_REGEX_ERR"), Ls(L"DLG_FIND"), MB_OK | MB_ICONERROR);
             return false;
         }
     };
@@ -4179,15 +4663,18 @@ static void Ne_New(HWND hwnd)
         wcsncpy_s(cfD.szFaceName, L"Segoe UI", LF_FACESIZE - 1);
         SendMessageW(hEdit, EM_SETCHARFORMAT, SCF_ALL, (LPARAM)&cfD);
         SendMessageW(hEdit, EM_SETBKGNDCOLOR, 0, RGB(255, 255, 255));
-        SendMessageW(hEdit, EM_SETEVENTMASK, 0, ENM_CHANGE | ENM_SELCHANGE | ENM_LINK);
+        SendMessageW(hEdit, EM_SETEVENTMASK, 0, ENM_CHANGE | ENM_SELCHANGE | ENM_LINK | ENM_SCROLL);
         Ne_SubclassEditForCaret(hEdit);
         SendMessageW(hEdit, EM_SETEVENTMASK, 0, ENM_SELCHANGE);  // suppress EN_CHANGE during attach
         Ne_AttachScrollbars(hEdit);
-        SendMessageW(hEdit, EM_SETEVENTMASK, 0, ENM_CHANGE | ENM_SELCHANGE | ENM_LINK);
+        SendMessageW(hEdit, EM_SETEVENTMASK, 0, ENM_CHANGE | ENM_SELCHANGE | ENM_LINK | ENM_SCROLL);
         SetFocus(hEdit);
     }
     NeTabs_UpdateTabTitle(hwnd, NeTabs_GetActiveIndex(hwnd));
     Ne_SyncScrollbarVisibility(hwnd);
+    Ne_SyncRichGutters(hwnd);
+    // Apply saved zoom to the new RTF tab.
+    if (hEdit) SendMessageW(hEdit, EM_SETZOOM, (WPARAM)g_zoomRtf, 100);
 }
 
 static bool Ne_LoadPathIntoEditor(HWND hwnd, const std::wstring& path)
@@ -4264,7 +4751,7 @@ static bool Ne_LoadPathIntoEditor(HWND hwnd, const std::wstring& path)
         if (!doc->langUserSet)
             doc->langId = Ne_LangFromExt(path);
 
-        Ne_SetScintillaLexer(doc->hSci, s_langs[doc->langId].lexer);
+        Ne_ApplyLang(doc->hSci, doc->langId);
 
         // Load text (UTF-8 is Scintilla's native encoding).
         SendMessageW(doc->hSci, SCI_SETTEXT, 0, (LPARAM)utf8.c_str());
@@ -4275,6 +4762,10 @@ static bool Ne_LoadPathIntoEditor(HWND hwnd, const std::wstring& path)
         ShowWindow(hEdit, SW_HIDE);
         ShowWindow(doc->hSci, SW_SHOW);
         SetFocus(doc->hSci);
+        // Apply saved zoom to the Scintilla tab.
+        SendMessageW(doc->hSci, SCI_SETZOOM, (WPARAM)g_zoomSci, 0);
+        // Hide the RichEdit gutter (Scintilla has its own built-in margin).
+        Ne_SyncRichGutters(hwnd);
 
         doc->path = path;
         doc->modified = false;
@@ -4296,6 +4787,8 @@ static bool Ne_LoadPathIntoEditor(HWND hwnd, const std::wstring& path)
         doc->langUserSet = false;
     }
     ShowWindow(hEdit, SW_SHOW);
+    // Apply saved zoom to the RTF tab.
+    SendMessageW(hEdit, EM_SETZOOM, (WPARAM)g_zoomRtf, 100);
 
     std::string streamBytes = bytes;
     doc->suppressChange = true;
@@ -4303,6 +4796,8 @@ static bool Ne_LoadPathIntoEditor(HWND hwnd, const std::wstring& path)
     doc->suppressChange = false;
     Ne_RebuildHRList(hEdit);
     InvalidateRect(hEdit, NULL, FALSE);
+    // Ensure gutter exists, is positioned, and repaints with the new content.
+    Ne_SyncRichGutters(hwnd);
     doc->path = path;
     doc->modified = false;
     Ne_DetectEncoding(doc, bytes);
@@ -4501,7 +4996,39 @@ static bool Ne_SaveAs(HWND hwnd)
 static bool Ne_Save(HWND hwnd)
 {
     NeTabDoc* doc = NeTabs_GetActiveDoc(hwnd);
-    if (!doc || doc->path.empty()) return Ne_SaveAs(hwnd);
+    if (!doc) return false;
+
+    // ── FTP/SFTP remote file: save locally then upload ─────────────────────
+    if (doc->isFtpFile && !doc->ftpRemotePath.empty()) {
+        if (doc->path.empty()) return Ne_SaveAs(hwnd);
+        if (!Ne_SaveToPath(hwnd, doc->path)) return false;
+        if (!NeFtp_SetActiveConn(doc->ftpProfileId)) {
+            NeDialogButtonSpec btn = { IDOK, Ls(L"BTN_OK"), NeBtnTone::Red, IDI_ERROR, 0 };
+            Ne_ShowChoiceDialog(hwnd, Ls(L"FTP_CONN_FAILED"),
+                                Ls(L"FTP_STATUS"), &btn, 1, IDOK);
+            return false;
+        }
+        SetCursor(LoadCursorW(NULL, IDC_WAIT));
+        bool ok = NeFtp_Upload(doc->path, doc->ftpRemotePath);
+        SetCursor(LoadCursorW(NULL, IDC_ARROW));
+        if (!ok) {
+            NeDialogButtonSpec btn = { IDOK, Ls(L"BTN_OK"), NeBtnTone::Red, IDI_ERROR, 0 };
+            Ne_ShowChoiceDialog(hwnd, Ls(L"FTP_CONN_FAILED"),
+                                NeFtp_GetLastError(), &btn, 1, IDOK);
+            return false;
+        }
+        doc->modified = false;
+        NeTabs_UpdateTabTitle(hwnd, NeTabs_GetActiveIndex(hwnd));
+        Ne_UpdateTitle(hwnd);
+        // ── Success notification ──────────────────────────────────────────
+        NeDialogButtonSpec okBtn = { IDOK, Ls(L"BTN_OK"), NeBtnTone::Green,
+                                     IDI_INFORMATION, 0 };
+        Ne_ShowChoiceDialog(hwnd, Ls(L"FTP_STATUS"),
+                            Ls(L"MSG_FTP_UPLOAD_OK"), &okBtn, 1, IDOK);
+        return true;
+    }
+
+    if (doc->path.empty()) return Ne_SaveAs(hwnd);
     if (!Ne_SaveToPath(hwnd, doc->path)) return false;
     doc->modified = false;
     Ne_RememberDiskStamp(doc);
@@ -4810,6 +5337,37 @@ static LRESULT CALLBACK NsbAboutEditProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
 }
 
 static void ShowNsbLicenseDialog(HWND parent); // forward declaration
+// ── FTP dialog forward declarations ──────────────────────────────────────────
+static void Ne_ShowFtpSiteDialog(HWND parent, NeProfile* existing);
+static void Ne_ShowFtpBrowser(HWND parent, int64_t profileId);
+static void Ne_ShowChmodDialog(HWND parent, const std::wstring& remotePath, int currentMode);
+static bool Ne_ShowPasswordPrompt(HWND parent, const std::wstring& siteName, std::wstring& outPw);
+static void Ne_UpdateFtpStatus(HWND hwnd);
+
+// Rebuild the FTP popup from scratch (called in WM_INITMENUPOPUP for s_hFtpMenu).
+static void Ne_RebuildFtpMenu(HWND hwnd)
+{
+    while (GetMenuItemCount(s_hFtpMenu) > 0)
+        RemoveMenu(s_hFtpMenu, 0, MF_BYPOSITION);
+    Ne_AppendMenuOD(s_hFtpMenu, MF_STRING, IDM_FTP_ADD_SITE, Ls(L"FTP_ADD_SITE"));
+    NeTabDoc* aDoc = NeTabs_GetActiveDoc(hwnd);
+    int64_t activeTabProfileId = (aDoc && aDoc->isFtpFile) ? aDoc->ftpProfileId : 0;
+    if (activeTabProfileId && NeFtp_IsConnected(activeTabProfileId))
+        Ne_AppendMenuOD(s_hFtpMenu, MF_STRING, IDM_FTP_DISCONNECT, Ls(L"FTP_DISCONNECT"));
+    Ne_AppendMenuOD(s_hFtpMenu, MF_SEPARATOR, 0, NULL);
+    std::vector<NeProfile> ftpProfiles;
+    NeProfiles_List(ftpProfiles);
+    for (int pi = 0; pi < (int)ftpProfiles.size() && pi < 100; ++pi) {
+        std::wstring label = ftpProfiles[pi].friendlyName
+                           + L"  (" + ftpProfiles[pi].protocol + L")";
+        HICON hIcon = (activeTabProfileId && ftpProfiles[pi].id == activeTabProfileId)
+                      ? g_hFtpMenuIcon : NULL;
+        Ne_AppendMenuOD(s_hFtpMenu, MF_STRING,
+                        IDM_FTP_CONNECT_BASE + pi, label.c_str(),
+                        false, hIcon);
+    }
+}
+
 static void ShowNsbCreditsDialog(HWND parent); // forward declaration
 
 static LRESULT CALLBACK NsbAboutWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
@@ -4965,6 +5523,1339 @@ static void ShowNsbLicenseDialog(HWND parent)
     if (parent && IsWindow(parent)) { EnableWindow(parent, TRUE); SetForegroundWindow(parent); }
 }
 
+// ============================================================================
+//  FTP / SFTP dialogs
+// ============================================================================
+
+// ── Ne_UpdateFtpStatus ───────────────────────────────────────────────────────
+static void Ne_UpdateFtpStatus(HWND hwnd)
+{
+    HWND hSb = GetDlgItem(hwnd, IDC_NE_STATUSBAR);
+    if (!hSb) return;
+    // Show FTP status if the active tab belongs to a connected profile.
+    NeTabDoc* doc = NeTabs_GetActiveDoc(hwnd);
+    if (doc && doc->isFtpFile && doc->ftpProfileId > 0
+            && NeFtp_IsConnected(doc->ftpProfileId)) {
+        NeFtp_SetActiveConn(doc->ftpProfileId);
+        const NeProfile& p = NeFtp_GetActiveProfile();
+        std::wstring msg = std::wstring(Ls(L"FTP_STATUS"))
+                         + L" " + p.friendlyName
+                         + L" (" + p.protocol + L")";
+        NeStatusBar_SetInfo(hSb, msg.c_str());
+    } else {
+        // Reset to encoding/language info via the normal update path.
+        HWND hEdit = NeTabs_GetActiveEdit(hwnd);
+        NeTabDoc* doc = NeTabs_GetActiveDoc(hwnd);
+        if (hEdit && doc) {
+            NeEncoding enc = (NeEncoding)doc->encoding;
+            if (doc->langId >= 0 && doc->langId < NE_LANG_COUNT)
+                NeStatusBar_SetInfo(hSb, s_langs[doc->langId].name);
+            else
+                NeStatusBar_SetInfo(hSb, Ne_EncLabel(enc));
+        } else {
+            NeStatusBar_SetInfo(hSb, L"");
+        }
+    }
+}
+
+// ── Password prompt ───────────────────────────────────────────────────────────
+struct NePwPromptData {
+    std::wstring siteName;
+    std::wstring result;
+    bool         ok       = false;
+    NeDialogData dd;
+};
+
+static LRESULT CALLBACK Ne_PwPromptProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+    NePwPromptData* d = (NePwPromptData*)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+    switch (msg) {
+    case WM_COMMAND:
+        if (LOWORD(wParam) == IDOK) {
+            if (!d) break;
+            wchar_t buf[512] = {};
+            GetWindowTextW(GetDlgItem(hwnd, 101), buf, 512);
+            d->result = buf;
+            d->ok     = true;
+            PostMessageW(hwnd, WM_CLOSE, 0, 0);
+            return 0;
+        }
+        if (LOWORD(wParam) == IDCANCEL)
+            { PostMessageW(hwnd, WM_CLOSE, 0, 0); return 0; }
+        return 0;
+    case WM_DRAWITEM:
+        if (d) Ne_DrawDialogButton((const DRAWITEMSTRUCT*)lParam, &d->dd);
+        return TRUE;
+    case WM_CLOSE:
+        PostQuitMessage(0);
+        DestroyWindow(hwnd);
+        return 0;
+    case WM_CTLCOLORSTATIC:
+    case WM_CTLCOLOREDIT:
+        SetBkColor((HDC)wParam, RGB(255,255,255));
+        return (LRESULT)GetStockObject(WHITE_BRUSH);
+    }
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+static bool Ne_ShowPasswordPrompt(HWND parent,
+                                   const std::wstring& siteName,
+                                   std::wstring& outPw)
+{
+    HINSTANCE hi = GetModuleHandleW(NULL);
+    WNDCLASSW wc = {}; wc.lpfnWndProc = Ne_PwPromptProc; wc.hInstance = hi;
+    wc.hbrBackground = (HBRUSH)(COLOR_WINDOW+1); wc.lpszClassName = L"NeFtpPwClass";
+    if (!GetClassInfoW(hi, L"NeFtpPwClass", &wc)) RegisterClassW(&wc);
+
+    const int W = S(340), H = S(160);
+    RECT pr = {}; if (parent && IsWindow(parent)) GetWindowRect(parent, &pr);
+    int x = (pr.left+pr.right)/2 - W/2, y = (pr.top+pr.bottom)/2 - H/2;
+
+    NePwPromptData d;
+    d.siteName = siteName;
+
+    HWND dlg = CreateWindowExW(WS_EX_DLGMODALFRAME|WS_EX_WINDOWEDGE,
+        L"NeFtpPwClass",
+        Ls(L"FTP_PW_PROMPT"),
+        WS_POPUP|WS_CAPTION|WS_SYSMENU|WS_VISIBLE,
+        x, y, W, H, parent, NULL, hi, NULL);
+    if (!dlg) return false;
+
+    SetWindowLongPtrW(dlg, GWLP_USERDATA, (LONG_PTR)&d);
+
+    HICON hIco = LoadIconW(hi, MAKEINTRESOURCEW(IDI_APPICON));
+    if (hIco) { SendMessageW(dlg, WM_SETICON, ICON_SMALL, (LPARAM)hIco);
+                SendMessageW(dlg, WM_SETICON, ICON_BIG,   (LPARAM)hIco); }
+
+    RECT rc; GetClientRect(dlg, &rc);
+    const int PAD = S(12), BTN_H = S(28);
+    HFONT hFont = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+
+    // Label
+    std::wstring label = std::wstring(Ls(L"FTP_PW_FOR")) + L" " + siteName + L":";
+    HWND hLbl = CreateWindowExW(0, L"STATIC", label.c_str(),
+        WS_CHILD|WS_VISIBLE|SS_LEFT,
+        PAD, PAD, rc.right - 2*PAD, S(20), dlg, (HMENU)102, hi, NULL);
+    SendMessageW(hLbl, WM_SETFONT, (WPARAM)hFont, TRUE);
+
+    // Password edit
+    HWND hEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+        WS_CHILD|WS_VISIBLE|WS_TABSTOP|ES_PASSWORD|ES_AUTOHSCROLL,
+        PAD, PAD + S(26), rc.right - 2*PAD, S(24), dlg, (HMENU)101, hi, NULL);
+    SendMessageW(hEdit, WM_SETFONT, (WPARAM)hFont, TRUE);
+
+    // Buttons
+    d.dd.buttonCount = 2;
+    d.dd.buttons[0] = { IDOK,     Ls(L"BTN_OK"),     NeBtnTone::Green, IDI_INFORMATION,
+                         Ne_MeasureButtonWidth(Ls(L"BTN_OK")) };
+    d.dd.buttons[1] = { IDCANCEL, Ls(L"BTN_CANCEL"), NeBtnTone::Red,   IDI_ERROR,
+                         Ne_MeasureButtonWidth(Ls(L"BTN_CANCEL")) };
+
+    int totalBW = d.dd.buttons[0].width + S(8) + d.dd.buttons[1].width;
+    int bx = (rc.right - totalBW) / 2, by = rc.bottom - PAD - BTN_H;
+
+    for (int i = 0; i < 2; ++i) {
+        HWND hBtn = CreateWindowExW(0, L"BUTTON", d.dd.buttons[i].text.c_str(),
+            WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_OWNERDRAW,
+            bx, by, d.dd.buttons[i].width, BTN_H,
+            dlg, (HMENU)(UINT_PTR)d.dd.buttons[i].id, hi, NULL);
+        SendMessageW(hBtn, WM_SETFONT, (WPARAM)hFont, TRUE);
+        WNDPROC prev = (WNDPROC)SetWindowLongPtrW(hBtn, GWLP_WNDPROC, (LONG_PTR)Ne_BtnHoverProc);
+        SetPropW(hBtn, L"NePrevProc", (HANDLE)prev);
+        bx += d.dd.buttons[i].width + S(8);
+    }
+
+    SetFocus(hEdit);
+    if (parent && IsWindow(parent)) EnableWindow(parent, FALSE);
+    MSG m;
+    while (GetMessageW(&m, NULL, 0, 0)) {
+        if (!IsDialogMessageW(dlg, &m)) { TranslateMessage(&m); DispatchMessageW(&m); }
+    }
+    if (parent && IsWindow(parent)) { EnableWindow(parent, TRUE); SetForegroundWindow(parent); }
+
+    outPw = d.result;
+    return d.ok;
+}
+
+// ── FTP Site dialog (Add / Edit) ──────────────────────────────────────────────
+struct NeFtpSiteData {
+    NeProfile    profile;
+    bool         isEdit    = false;
+    bool         saved     = false;
+    bool         deleted   = false;
+    HWND         hChkRemember = NULL;
+    NeDialogData dd;
+};
+
+static LRESULT CALLBACK Ne_FtpSiteProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+    NeFtpSiteData* d = (NeFtpSiteData*)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+    switch (msg) {
+    case WM_COMMAND: {
+        int id = LOWORD(wParam);
+        int ev = HIWORD(wParam);
+        // Protocol radio — auto-fill default port
+        if (id == 1021 && ev == BN_CLICKED) {
+            wchar_t portBuf[16] = {}; GetWindowTextW(GetDlgItem(hwnd, 1024), portBuf, 16);
+            if (_wtoi(portBuf) == 22) SetWindowTextW(GetDlgItem(hwnd, 1024), L"21");
+        }
+        if (id == 1022 && ev == BN_CLICKED) {
+            wchar_t portBuf[16] = {}; GetWindowTextW(GetDlgItem(hwnd, 1024), portBuf, 16);
+            if (_wtoi(portBuf) == 21) SetWindowTextW(GetDlgItem(hwnd, 1024), L"22");
+        }
+        // Save
+        if (id == 1029) {
+            if (!d) break;
+            wchar_t buf[512] = {};
+            GetWindowTextW(GetDlgItem(hwnd, 1020), buf, 512); d->profile.friendlyName = buf;
+            bool isSftp = (SendMessageW(GetDlgItem(hwnd, 1022), BM_GETCHECK, 0, 0) == BST_CHECKED);
+            d->profile.protocol = isSftp ? L"SFTP" : L"FTP";
+            GetWindowTextW(GetDlgItem(hwnd, 1023), buf, 512); d->profile.host = buf;
+            GetWindowTextW(GetDlgItem(hwnd, 1024), buf, 16);  d->profile.port = _wtoi(buf);
+            if (d->profile.port <= 0) d->profile.port = isSftp ? 22 : 21;
+            GetWindowTextW(GetDlgItem(hwnd, 1025), buf, 512); d->profile.username = buf;
+            GetWindowTextW(GetDlgItem(hwnd, 1026), buf, 512); d->profile.password = buf;
+            d->profile.rememberPassword =
+                (SendMessageW(d->hChkRemember, BM_GETCHECK, 0, 0) == BST_CHECKED);
+            GetWindowTextW(GetDlgItem(hwnd, 1028), buf, 512); d->profile.initialPath = buf;
+            if (d->profile.friendlyName.empty() || d->profile.host.empty()) break;
+            d->saved = true;
+            PostMessageW(hwnd, WM_CLOSE, 0, 0);
+        }
+        // Delete (edit mode)
+        if (id == 1030 && d && d->isEdit) {
+            d->deleted = true;
+            PostMessageW(hwnd, WM_CLOSE, 0, 0);
+        }
+        // Cancel
+        if (id == IDCANCEL) PostMessageW(hwnd, WM_CLOSE, 0, 0);
+        return 0;
+    }
+    case WM_DRAWITEM: {
+        DRAWITEMSTRUCT* dis = (DRAWITEMSTRUCT*)lParam;
+        if (d) {
+            // Let Ne_DrawDialogButton handle all owner-draw buttons (it skips unknown IDs)
+            if (Ne_ButtonIndexById(&d->dd, dis->CtlID) >= 0) {
+                Ne_DrawDialogButton(dis, &d->dd);
+                return TRUE;
+            }
+        }
+        if (d && d->hChkRemember && dis->hwndItem == d->hChkRemember) {
+            DrawCustomCheckbox(dis);
+            return TRUE;
+        }
+        return FALSE;
+    }
+    case WM_SETTINGCHANGE:
+        if (d && d->hChkRemember) OnCheckboxSettingChange(hwnd);
+        return 0;
+    case WM_CLOSE:
+        PostQuitMessage(0);
+        DestroyWindow(hwnd);
+        return 0;
+    case WM_CTLCOLORSTATIC:
+    case WM_CTLCOLOREDIT:
+        SetBkColor((HDC)wParam, RGB(255,255,255));
+        return (LRESULT)GetStockObject(WHITE_BRUSH);
+    }
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+static void Ne_ShowFtpSiteDialog(HWND parent, NeProfile* existing)
+{
+    HINSTANCE hi = GetModuleHandleW(NULL);
+    WNDCLASSW wc = {}; wc.lpfnWndProc = Ne_FtpSiteProc; wc.hInstance = hi;
+    wc.hbrBackground = (HBRUSH)(COLOR_WINDOW+1); wc.lpszClassName = L"NeFtpSiteClass";
+    if (!GetClassInfoW(hi, L"NeFtpSiteClass", &wc)) RegisterClassW(&wc);
+
+    NeFtpSiteData d;
+    d.isEdit = (existing != nullptr);
+    if (existing) d.profile = *existing;
+    else { d.profile.protocol = L"FTP"; d.profile.port = 21; d.profile.initialPath = L"/"; }
+
+    const int W = S(460), H = S(490);
+    RECT pr = {}; if (parent && IsWindow(parent)) GetWindowRect(parent, &pr);
+    int x = (pr.left+pr.right)/2 - W/2, y = (pr.top+pr.bottom)/2 - H/2;
+    if (y < 30) y = 30;
+
+    HWND dlg = CreateWindowExW(WS_EX_DLGMODALFRAME|WS_EX_WINDOWEDGE,
+        L"NeFtpSiteClass",
+        d.isEdit ? Ls(L"FTP_DLG_SITE_EDIT") : Ls(L"FTP_DLG_SITE_ADD"),
+        WS_POPUP|WS_CAPTION|WS_SYSMENU|WS_VISIBLE,
+        x, y, W, H, parent, NULL, hi, NULL);
+    if (!dlg) return;
+
+    SetWindowLongPtrW(dlg, GWLP_USERDATA, (LONG_PTR)&d);
+
+    HICON hIco = LoadIconW(hi, MAKEINTRESOURCEW(IDI_APPICON));
+    if (hIco) { SendMessageW(dlg, WM_SETICON, ICON_SMALL, (LPARAM)hIco);
+                SendMessageW(dlg, WM_SETICON, ICON_BIG,   (LPARAM)hIco); }
+
+    RECT rc; GetClientRect(dlg, &rc);
+    const int PAD = S(16), LBL_W = S(110), EDIT_H = S(26), ROW = S(42), BTN_H = S(34);
+    HFONT hFont = Ne_CreateDialogFont(false);  // 12pt Segoe UI
+    int editX = PAD + LBL_W + S(6), editW = rc.right - editX - PAD;
+    int y0 = PAD;
+
+    // Helper lambdas as inline
+    auto AddLabel = [&](const wchar_t* key, int row) {
+        HWND h = CreateWindowExW(0, L"STATIC", Ls(key),
+            WS_CHILD|WS_VISIBLE|SS_RIGHT,
+            PAD, row + S(3), LBL_W, S(18), dlg, NULL, hi, NULL);
+        SendMessageW(h, WM_SETFONT, (WPARAM)hFont, TRUE);
+    };
+    auto AddEdit = [&](int id, const wchar_t* text, int row, DWORD extra = 0) -> HWND {
+        HWND h = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", text,
+            WS_CHILD|WS_VISIBLE|WS_TABSTOP|ES_AUTOHSCROLL|extra,
+            editX, row, editW, EDIT_H, dlg, (HMENU)(UINT_PTR)id, hi, NULL);
+        SendMessageW(h, WM_SETFONT, (WPARAM)hFont, TRUE);
+        return h;
+    };
+
+    // Friendly name
+    AddLabel(L"FTP_FRIENDLY_NAME", y0);
+    AddEdit(1020, d.profile.friendlyName.c_str(), y0);
+    y0 += ROW;
+
+    // Protocol radios
+    HWND hLblProto = CreateWindowExW(0, L"STATIC", Ls(L"FTP_PROTOCOL"),
+        WS_CHILD|WS_VISIBLE|SS_RIGHT,
+        PAD, y0 + S(3), LBL_W, S(18), dlg, NULL, hi, NULL);
+    SendMessageW(hLblProto, WM_SETFONT, (WPARAM)hFont, TRUE);
+
+    HWND hFtp = CreateWindowExW(0, L"BUTTON", L"FTP",
+        WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_AUTORADIOBUTTON,
+        editX, y0, S(60), S(20), dlg, (HMENU)1021, hi, NULL);
+    SendMessageW(hFtp, WM_SETFONT, (WPARAM)hFont, TRUE);
+
+    HWND hSftp = CreateWindowExW(0, L"BUTTON", L"SFTP",
+        WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_AUTORADIOBUTTON,
+        editX + S(70), y0, S(60), S(20), dlg, (HMENU)1022, hi, NULL);
+    SendMessageW(hSftp, WM_SETFONT, (WPARAM)hFont, TRUE);
+
+    SendMessageW(d.profile.protocol == L"SFTP" ? hSftp : hFtp, BM_SETCHECK, BST_CHECKED, 0);
+    y0 += ROW;
+
+    // Host
+    AddLabel(L"FTP_HOST", y0);
+    AddEdit(1023, d.profile.host.c_str(), y0);
+    y0 += ROW;
+
+    // Port
+    AddLabel(L"FTP_PORT", y0);
+    wchar_t portStr[16] = {}; swprintf_s(portStr, L"%d", d.profile.port);
+    AddEdit(1024, portStr, y0, ES_NUMBER);
+    y0 += ROW;
+
+    // Username
+    AddLabel(L"FTP_USERNAME", y0);
+    AddEdit(1025, d.profile.username.c_str(), y0);
+    y0 += ROW;
+
+    // Password
+    AddLabel(L"FTP_PASSWORD", y0);
+    AddEdit(1026, d.profile.password.c_str(), y0, ES_PASSWORD);
+    y0 += ROW;
+
+    // Remember password checkbox
+    d.hChkRemember = CreateCustomCheckbox(dlg, 1027,
+        Ls(L"FTP_REMEMBER_PWD"), d.profile.rememberPassword,
+        PAD, y0, rc.right - 2*PAD, S(24), hi);
+    SendMessageW(d.hChkRemember, WM_SETFONT, (WPARAM)hFont, TRUE);
+    y0 += S(36);
+
+    // Initial folder
+    AddLabel(L"FTP_INITIAL_PATH", y0);
+    AddEdit(1028, d.profile.initialPath.c_str(), y0);
+    y0 += ROW;
+
+    // Buttons
+    int numBtns = d.isEdit ? 3 : 2;
+    d.dd.buttonCount = numBtns;
+    d.dd.buttons[0] = { 1029, Ls(L"FTP_SAVE"),   NeBtnTone::Green, IDI_INFORMATION,
+                         Ne_MeasureButtonWidth(Ls(L"FTP_SAVE")) };
+    d.dd.buttons[1] = { IDCANCEL, Ls(L"BTN_CANCEL"), NeBtnTone::Blue, IDI_ERROR,
+                         Ne_MeasureButtonWidth(Ls(L"BTN_CANCEL")) };
+    if (d.isEdit)
+        d.dd.buttons[2] = { 1030, Ls(L"FTP_DELETE"), NeBtnTone::Red, IDI_ERROR,
+                             Ne_MeasureButtonWidth(Ls(L"FTP_DELETE")) };
+
+    int totalBW = 0;
+    for (int i = 0; i < numBtns; ++i) totalBW += d.dd.buttons[i].width + (i ? S(8) : 0);
+    int bx = (rc.right - totalBW) / 2, by = rc.bottom - PAD - BTN_H;
+    for (int i = 0; i < numBtns; ++i) {
+        HWND hBtn = CreateWindowExW(0, L"BUTTON", d.dd.buttons[i].text.c_str(),
+            WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_OWNERDRAW,
+            bx, by, d.dd.buttons[i].width, BTN_H,
+            dlg, (HMENU)(UINT_PTR)d.dd.buttons[i].id, hi, NULL);
+        SendMessageW(hBtn, WM_SETFONT, (WPARAM)hFont, TRUE);
+        WNDPROC prev = (WNDPROC)SetWindowLongPtrW(hBtn, GWLP_WNDPROC, (LONG_PTR)Ne_BtnHoverProc);
+        SetPropW(hBtn, L"NePrevProc", (HANDLE)prev);
+        bx += d.dd.buttons[i].width + S(8);
+    }
+
+    if (parent && IsWindow(parent)) EnableWindow(parent, FALSE);
+    SetFocus(GetDlgItem(dlg, 1020));
+    MSG m;
+    while (GetMessageW(&m, NULL, 0, 0)) {
+        if (!IsDialogMessageW(dlg, &m)) { TranslateMessage(&m); DispatchMessageW(&m); }
+    }
+    if (parent && IsWindow(parent)) { EnableWindow(parent, TRUE); SetForegroundWindow(parent); }
+    DeleteObject(hFont);
+
+    if (d.deleted && d.profile.id > 0) {
+        NeProfiles_Delete(d.profile.id);
+    } else if (d.saved) {
+        if (d.isEdit)
+            NeProfiles_Update(d.profile);
+        else
+            NeProfiles_Add(d.profile);
+    }
+}
+
+// ── chmod dialog ──────────────────────────────────────────────────────────────
+struct NeChmodData {
+    std::wstring remotePath;
+    int          mode     = 0644;
+    bool         applied  = false;
+    HWND         hChk[9]  = {};      // [0-2]=owner rwx, [3-5]=group rwx, [6-8]=other rwx
+    HWND         hOctal   = NULL;
+    NeDialogData dd;
+};
+
+static void Ne_ChmodUpdateOctal(NeChmodData* d)
+{
+    if (!d->hOctal) return;
+    int m = 0;
+    static const int bits[9] = { 0400,0200,0100, 0040,0020,0010, 0004,0002,0001 };
+    for (int i = 0; i < 9; ++i) {
+        if (d->hChk[i] && SendMessageW(d->hChk[i], BM_GETCHECK, 0, 0) == BST_CHECKED)
+            m |= bits[i];
+    }
+    d->mode = m;
+    wchar_t buf[16];
+    swprintf_s(buf, L"%s %03o", Ls(L"FTP_CHMOD_OCTAL"), m);
+    SetWindowTextW(d->hOctal, buf);
+}
+
+static LRESULT CALLBACK Ne_ChmodProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+    NeChmodData* d = (NeChmodData*)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+    switch (msg) {
+    case WM_COMMAND: {
+        int id = LOWORD(wParam);
+        int ev = HIWORD(wParam);
+        // Any checkbox click → update octal display
+        if (ev == BN_CLICKED && id >= 3000 && id < 3009)
+            Ne_ChmodUpdateOctal(d);
+        // Apply
+        if (id == 3010) {
+            if (!d) break;
+            Ne_ChmodUpdateOctal(d);
+            if (NeFtp_Chmod(d->remotePath, d->mode)) {
+                d->applied = true;
+                PostMessageW(hwnd, WM_CLOSE, 0, 0);
+            } else {
+                MessageBoxW(hwnd, NeFtp_GetLastError().c_str(), Ls(L"FTP_DLG_CHMOD"), MB_ICONERROR|MB_OK);
+            }
+        }
+        if (id == IDCANCEL) PostMessageW(hwnd, WM_CLOSE, 0, 0);
+        return 0;
+    }
+    case WM_DRAWITEM: {
+        DRAWITEMSTRUCT* dis = (DRAWITEMSTRUCT*)lParam;
+        if (!d) return FALSE;
+        if (Ne_ButtonIndexById(&d->dd, dis->CtlID) >= 0) {
+            Ne_DrawDialogButton(dis, &d->dd);
+            return TRUE;
+        }
+        for (int i = 0; i < 9; ++i) {
+            if (d->hChk[i] && dis->hwndItem == d->hChk[i]) {
+                DrawCustomCheckbox(dis);
+                return TRUE;
+            }
+        }
+        return FALSE;
+    }
+    case WM_SETTINGCHANGE:
+        if (d) OnCheckboxSettingChange(hwnd);
+        return 0;
+    case WM_CLOSE:
+        PostQuitMessage(0);
+        DestroyWindow(hwnd);
+        return 0;
+    case WM_CTLCOLORSTATIC:
+    case WM_CTLCOLOREDIT:
+        SetBkColor((HDC)wParam, RGB(255,255,255));
+        return (LRESULT)GetStockObject(WHITE_BRUSH);
+    }
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+static void Ne_ShowChmodDialog(HWND parent, const std::wstring& remotePath, int currentMode)
+{
+    HINSTANCE hi = GetModuleHandleW(NULL);
+    WNDCLASSW wc = {}; wc.lpfnWndProc = Ne_ChmodProc; wc.hInstance = hi;
+    wc.hbrBackground = (HBRUSH)(COLOR_WINDOW+1); wc.lpszClassName = L"NeFtpChmodClass";
+    if (!GetClassInfoW(hi, L"NeFtpChmodClass", &wc)) RegisterClassW(&wc);
+
+    NeChmodData d;
+    d.remotePath = remotePath;
+    d.mode = (currentMode >= 0) ? currentMode : 0644;
+
+    const int W = S(440), H = S(360);
+    RECT pr = {}; if (parent && IsWindow(parent)) GetWindowRect(parent, &pr);
+    int x = (pr.left+pr.right)/2 - W/2, y = (pr.top+pr.bottom)/2 - H/2;
+    if (y < 30) y = 30;
+
+    // Build window title with the filename only
+    std::wstring title = std::wstring(Ls(L"FTP_DLG_CHMOD")) + L" \u2014 ";
+    size_t sl = remotePath.rfind(L'/');
+    title += (sl != std::wstring::npos) ? remotePath.substr(sl + 1) : remotePath;
+
+    HWND dlg = CreateWindowExW(WS_EX_DLGMODALFRAME|WS_EX_WINDOWEDGE,
+        L"NeFtpChmodClass", title.c_str(),
+        WS_POPUP|WS_CAPTION|WS_SYSMENU|WS_VISIBLE,
+        x, y, W, H, parent, NULL, hi, NULL);
+    if (!dlg) return;
+
+    SetWindowLongPtrW(dlg, GWLP_USERDATA, (LONG_PTR)&d);
+
+    HICON hIco = LoadIconW(hi, MAKEINTRESOURCEW(IDI_APPICON));
+    if (hIco) { SendMessageW(dlg, WM_SETICON, ICON_SMALL, (LPARAM)hIco);
+                SendMessageW(dlg, WM_SETICON, ICON_BIG,   (LPARAM)hIco); }
+
+    RECT rc; GetClientRect(dlg, &rc);
+    const int PAD = S(18), BTN_H = S(34), CHK_SZ = S(24);
+    HFONT hFont = Ne_CreateDialogFont(false);  // 12pt Segoe UI
+
+    // Grid geometry
+    const wchar_t* colNames[3] = { Ls(L"FTP_CHMOD_OWNER"), Ls(L"FTP_CHMOD_GROUP"), Ls(L"FTP_CHMOD_OTHER") };
+    const wchar_t* rowNames[3] = { Ls(L"FTP_CHMOD_READ"),  Ls(L"FTP_CHMOD_WRITE"), Ls(L"FTP_CHMOD_EXEC") };
+    int colW    = S(96);
+    int rowLblW = S(30);
+    int rowH    = S(44);
+    int gridX   = (rc.right - (rowLblW + 3 * colW)) / 2;
+    int gridY   = PAD + S(34);
+
+    // Column header labels
+    for (int c = 0; c < 3; ++c) {
+        HWND h = CreateWindowExW(0, L"STATIC", colNames[c],
+            WS_CHILD|WS_VISIBLE|SS_CENTER,
+            gridX + rowLblW + c * colW, PAD, colW, S(26), dlg, NULL, hi, NULL);
+        SendMessageW(h, WM_SETFONT, (WPARAM)hFont, TRUE);
+    }
+
+    // Row labels and custom checkboxes
+    const int bits9[9] = { 0400,0200,0100, 0040,0020,0010, 0004,0002,0001 };
+    for (int r = 0; r < 3; ++r) {
+        HWND hLbl = CreateWindowExW(0, L"STATIC", rowNames[r],
+            WS_CHILD|WS_VISIBLE|SS_CENTER,
+            gridX, gridY + r * rowH + (rowH - S(26)) / 2, rowLblW, S(26), dlg, NULL, hi, NULL);
+        SendMessageW(hLbl, WM_SETFONT, (WPARAM)hFont, TRUE);
+
+        for (int c = 0; c < 3; ++c) {
+            int bitIdx = c * 3 + r;
+            bool chk = (d.mode & bits9[bitIdx]) != 0;
+            int cx = gridX + rowLblW + c * colW + (colW - CHK_SZ) / 2;
+            int cy = gridY + r * rowH + (rowH - CHK_SZ) / 2;
+            d.hChk[bitIdx] = CreateCustomCheckbox(dlg, 3000 + bitIdx,
+                L"", chk, cx, cy, CHK_SZ, CHK_SZ, hi);
+            SendMessageW(d.hChk[bitIdx], WM_SETFONT, (WPARAM)hFont, TRUE);
+        }
+    }
+
+    // Octal display
+    wchar_t octalBuf[32] = {};
+    swprintf_s(octalBuf, L"%s %03o", Ls(L"FTP_CHMOD_OCTAL"), d.mode);
+    d.hOctal = CreateWindowExW(0, L"STATIC", octalBuf,
+        WS_CHILD|WS_VISIBLE|SS_CENTER,
+        PAD, gridY + 3 * rowH + S(10), rc.right - 2*PAD, S(26), dlg, NULL, hi, NULL);
+    SendMessageW(d.hOctal, WM_SETFONT, (WPARAM)hFont, TRUE);
+
+    // Buttons: Apply (Green) + Cancel (Blue)
+    d.dd.buttonCount = 2;
+    d.dd.buttons[0] = { 3010,     Ls(L"FTP_CHMOD_APPLY"), NeBtnTone::Green, IDI_INFORMATION,
+                         Ne_MeasureButtonWidth(Ls(L"FTP_CHMOD_APPLY")) };
+    d.dd.buttons[1] = { IDCANCEL, Ls(L"BTN_CANCEL"),      NeBtnTone::Blue,  IDI_ERROR,
+                         Ne_MeasureButtonWidth(Ls(L"BTN_CANCEL")) };
+
+    int totalBW = d.dd.buttons[0].width + S(10) + d.dd.buttons[1].width;
+    int bx = (rc.right - totalBW) / 2, by = rc.bottom - PAD - BTN_H;
+    for (int i = 0; i < 2; ++i) {
+        HWND hBtn = CreateWindowExW(0, L"BUTTON", d.dd.buttons[i].text.c_str(),
+            WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_OWNERDRAW,
+            bx, by, d.dd.buttons[i].width, BTN_H,
+            dlg, (HMENU)(UINT_PTR)d.dd.buttons[i].id, hi, NULL);
+        SendMessageW(hBtn, WM_SETFONT, (WPARAM)hFont, TRUE);
+        WNDPROC prev = (WNDPROC)SetWindowLongPtrW(hBtn, GWLP_WNDPROC, (LONG_PTR)Ne_BtnHoverProc);
+        SetPropW(hBtn, L"NePrevProc", (HANDLE)prev);
+        bx += d.dd.buttons[i].width + S(10);
+    }
+
+    if (parent && IsWindow(parent)) EnableWindow(parent, FALSE);
+    MSG m;
+    while (GetMessageW(&m, NULL, 0, 0)) {
+        if (!IsDialogMessageW(dlg, &m)) { TranslateMessage(&m); DispatchMessageW(&m); }
+    }
+    if (parent && IsWindow(parent)) { EnableWindow(parent, TRUE); SetForegroundWindow(parent); }
+    DeleteObject(hFont);
+}
+
+// ── Simple text-input dialog ──────────────────────────────────────────────────
+struct NeInputDlgData {
+    const wchar_t* prompt = nullptr;
+    std::wstring   value;
+    bool           ok     = false;
+    NeDialogData   dd;
+};
+
+static LRESULT CALLBACK Ne_InputDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+    NeInputDlgData* d = (NeInputDlgData*)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+    switch (msg) {
+    case WM_COMMAND: {
+        int id = LOWORD(wParam);
+        if (id == IDOK) {
+            if (d) {
+                wchar_t buf[MAX_PATH] = {};
+                GetDlgItemTextW(hwnd, 4001, buf, MAX_PATH);
+                d->value = buf;
+                d->ok = (buf[0] != L'\0');
+            }
+            PostMessageW(hwnd, WM_CLOSE, 0, 0);
+        }
+        if (id == IDCANCEL) PostMessageW(hwnd, WM_CLOSE, 0, 0);
+        return 0;
+    }
+    case WM_DRAWITEM: {
+        DRAWITEMSTRUCT* dis = (DRAWITEMSTRUCT*)lParam;
+        if (d && Ne_ButtonIndexById(&d->dd, dis->CtlID) >= 0) {
+            Ne_DrawDialogButton(dis, &d->dd);
+            return TRUE;
+        }
+        return FALSE;
+    }
+    case WM_CLOSE:
+        PostQuitMessage(0);
+        DestroyWindow(hwnd);
+        return 0;
+    case WM_CTLCOLORSTATIC:
+    case WM_CTLCOLOREDIT:
+        SetBkColor((HDC)wParam, RGB(255,255,255));
+        return (LRESULT)GetStockObject(WHITE_BRUSH);
+    }
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+static bool Ne_ShowInputDialog(HWND parent, const wchar_t* title, const wchar_t* prompt, std::wstring& out)
+{
+    HINSTANCE hi = GetModuleHandleW(NULL);
+    WNDCLASSW wc = {}; wc.lpfnWndProc = Ne_InputDlgProc; wc.hInstance = hi;
+    wc.hbrBackground = (HBRUSH)(COLOR_WINDOW+1); wc.lpszClassName = L"NeInputDlgClass";
+    if (!GetClassInfoW(hi, L"NeInputDlgClass", &wc)) RegisterClassW(&wc);
+
+    NeInputDlgData d;
+    d.prompt = prompt;
+
+    const int W = S(360), H = S(150);
+    RECT pr = {}; if (parent && IsWindow(parent)) GetWindowRect(parent, &pr);
+    int x = (pr.left+pr.right)/2 - W/2, y = (pr.top+pr.bottom)/2 - H/2;
+    if (y < 30) y = 30;
+
+    HWND dlg = CreateWindowExW(WS_EX_DLGMODALFRAME|WS_EX_WINDOWEDGE,
+        L"NeInputDlgClass", title, WS_POPUP|WS_CAPTION|WS_SYSMENU|WS_VISIBLE,
+        x, y, W, H, parent, NULL, hi, NULL);
+    if (!dlg) return false;
+
+    SetWindowLongPtrW(dlg, GWLP_USERDATA, (LONG_PTR)&d);
+
+    HICON hIco = LoadIconW(hi, MAKEINTRESOURCEW(IDI_APPICON));
+    if (hIco) { SendMessageW(dlg, WM_SETICON, ICON_SMALL, (LPARAM)hIco);
+                SendMessageW(dlg, WM_SETICON, ICON_BIG,   (LPARAM)hIco); }
+
+    RECT rc; GetClientRect(dlg, &rc);
+    const int PAD = S(14), BTN_H = S(32);
+    HFONT hFont = Ne_CreateDialogFont(false);
+
+    HWND hLbl = CreateWindowExW(0, L"STATIC", prompt, WS_CHILD|WS_VISIBLE|SS_LEFT,
+        PAD, PAD, rc.right - 2*PAD, S(22), dlg, NULL, hi, NULL);
+    SendMessageW(hLbl, WM_SETFONT, (WPARAM)hFont, TRUE);
+
+    HWND hEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+        WS_CHILD|WS_VISIBLE|WS_TABSTOP|ES_AUTOHSCROLL,
+        PAD, PAD + S(28), rc.right - 2*PAD, S(26), dlg, (HMENU)4001, hi, NULL);
+    SendMessageW(hEdit, WM_SETFONT, (WPARAM)hFont, TRUE);
+
+    d.dd.buttonCount = 2;
+    d.dd.buttons[0] = { IDOK,     Ls(L"BTN_OK"),     NeBtnTone::Green, IDI_INFORMATION,
+                         Ne_MeasureButtonWidth(Ls(L"BTN_OK")) };
+    d.dd.buttons[1] = { IDCANCEL, Ls(L"BTN_CANCEL"), NeBtnTone::Blue,  IDI_ERROR,
+                         Ne_MeasureButtonWidth(Ls(L"BTN_CANCEL")) };
+
+    int totalBW = d.dd.buttons[0].width + S(8) + d.dd.buttons[1].width;
+    int bx = (rc.right - totalBW) / 2, by = rc.bottom - PAD - BTN_H;
+    for (int i = 0; i < 2; ++i) {
+        HWND hBtn = CreateWindowExW(0, L"BUTTON", d.dd.buttons[i].text.c_str(),
+            WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_OWNERDRAW,
+            bx, by, d.dd.buttons[i].width, BTN_H,
+            dlg, (HMENU)(UINT_PTR)d.dd.buttons[i].id, hi, NULL);
+        SendMessageW(hBtn, WM_SETFONT, (WPARAM)hFont, TRUE);
+        WNDPROC prev = (WNDPROC)SetWindowLongPtrW(hBtn, GWLP_WNDPROC, (LONG_PTR)Ne_BtnHoverProc);
+        SetPropW(hBtn, L"NePrevProc", (HANDLE)prev);
+        bx += d.dd.buttons[i].width + S(8);
+    }
+
+    SetFocus(hEdit);
+    if (parent && IsWindow(parent)) EnableWindow(parent, FALSE);
+    MSG m;
+    while (GetMessageW(&m, NULL, 0, 0)) {
+        if (!IsDialogMessageW(dlg, &m)) { TranslateMessage(&m); DispatchMessageW(&m); }
+    }
+    if (parent && IsWindow(parent)) { EnableWindow(parent, TRUE); SetForegroundWindow(parent); }
+    DeleteObject(hFont);
+    if (d.ok) { out = d.value; return true; }
+    return false;
+}
+
+// ── FTP Browser (TreeView) ────────────────────────────────────────────────────
+struct NeFtpTreeNode {
+    std::wstring fullPath;
+    std::wstring name;
+    bool         isDir  = false;
+    bool         loaded = false;
+};
+
+struct NeFtpBrowserData {
+    HWND                       hwndParent;
+    HWND                       hwndTree;
+    std::vector<NeFtpTreeNode> nodes;
+    int                        iFolderClosed = 0;
+    int                        iFolderOpen   = 0;
+    HTREEITEM                  htiRoot       = nullptr;
+    std::wstring               pendingOpenLocal;
+    std::wstring               pendingOpenRemote;
+    NeDialogData               dd;  // holds Refresh + Close
+    int64_t                    profileId     = 0;
+    // ── Save mode ─────────────────────────────────────────────────────────────
+    bool                       saveMode           = false;
+    HWND                       hFilenameEdit      = NULL;  // filename input (save mode)
+    std::wstring               pendingSaveRemotePath;      // set when user confirms save
+};
+
+static HTREEITEM Ne_FtpTreeAddItem(HWND hTree, HTREEITEM hParent,
+    const std::wstring& name, bool isDir, int nodeIdx,
+    int iFolderClosed, int iFolderOpen)
+{
+    SHFILEINFOW sfi = {};
+    int iImg = iFolderClosed;
+    if (!isDir) {
+        SHGetFileInfoW(name.c_str(), FILE_ATTRIBUTE_NORMAL, &sfi, sizeof(sfi),
+            SHGFI_USEFILEATTRIBUTES | SHGFI_SYSICONINDEX | SHGFI_SMALLICON);
+        iImg = sfi.iIcon;
+    }
+    TVINSERTSTRUCTW tvi = {};
+    tvi.hParent             = hParent;
+    tvi.hInsertAfter        = TVI_LAST;
+    tvi.item.mask           = TVIF_TEXT | TVIF_PARAM | TVIF_IMAGE | TVIF_SELECTEDIMAGE;
+    tvi.item.pszText        = (LPWSTR)name.c_str();
+    tvi.item.lParam         = (LPARAM)(INT_PTR)nodeIdx;
+    tvi.item.iImage         = iImg;
+    tvi.item.iSelectedImage = isDir ? iFolderOpen : iImg;
+    HTREEITEM hItem = TreeView_InsertItem(hTree, &tvi);
+    if (isDir && hItem) {
+        TVINSERTSTRUCTW dummy = {};
+        dummy.hParent      = hItem;
+        dummy.hInsertAfter = TVI_LAST;
+        dummy.item.mask    = TVIF_TEXT | TVIF_PARAM;
+        dummy.item.pszText = (LPWSTR)L"";
+        dummy.item.lParam  = (LPARAM)(INT_PTR)-1;
+        TreeView_InsertItem(hTree, &dummy);
+    }
+    return hItem;
+}
+
+static void Ne_FtpTreeLoadChildren(HWND hwnd, HTREEITEM hItem, NeFtpBrowserData* d, int nodeIdx)
+{
+    if (d->nodes[nodeIdx].loaded) return;
+    SetCursor(LoadCursorW(NULL, IDC_WAIT));
+    std::vector<NeFtpEntry> entries;
+    bool ok = NeFtp_ListDir(d->nodes[nodeIdx].fullPath, entries);
+    SetCursor(LoadCursorW(NULL, IDC_ARROW));
+    if (!ok) {
+        MessageBoxW(hwnd, NeFtp_GetLastError().c_str(), Ls(L"FTP_DLG_BROWSER"), MB_ICONERROR|MB_OK);
+        return;
+    }
+    // Remove dummy child
+    HTREEITEM hDummy = TreeView_GetChild(d->hwndTree, hItem);
+    if (hDummy) TreeView_DeleteItem(d->hwndTree, hDummy);
+    // Sort: dirs first, then alphabetically
+    std::sort(entries.begin(), entries.end(), [](const NeFtpEntry& a, const NeFtpEntry& b) {
+        if (a.isDir != b.isDir) return a.isDir > b.isDir;
+        return _wcsicmp(a.name.c_str(), b.name.c_str()) < 0;
+    });
+    std::wstring base = d->nodes[nodeIdx].fullPath;
+    if (!base.empty() && base.back() != L'/') base += L'/';
+    for (auto& e : entries) {
+        NeFtpTreeNode child;
+        child.name     = e.name;
+        child.fullPath = base + e.name;
+        child.isDir    = e.isDir;
+        child.loaded   = false;
+        int idx = (int)d->nodes.size();
+        d->nodes.push_back(child);
+        Ne_FtpTreeAddItem(d->hwndTree, hItem, e.name, e.isDir, idx, d->iFolderClosed, d->iFolderOpen);
+    }
+    d->nodes[nodeIdx].loaded = true;
+}
+
+static void Ne_FtpTreeReloadItem(HWND hwnd, NeFtpBrowserData* d, HTREEITEM hItem, int nodeIdx)
+{
+    d->nodes[nodeIdx].loaded = false;
+    HTREEITEM hChild = TreeView_GetChild(d->hwndTree, hItem);
+    while (hChild) {
+        HTREEITEM hNext = TreeView_GetNextSibling(d->hwndTree, hChild);
+        TreeView_DeleteItem(d->hwndTree, hChild);
+        hChild = hNext;
+    }
+    TVINSERTSTRUCTW dummy = {};
+    dummy.hParent      = hItem;
+    dummy.hInsertAfter = TVI_LAST;
+    dummy.item.mask    = TVIF_TEXT | TVIF_PARAM;
+    dummy.item.pszText = (LPWSTR)L"";
+    dummy.item.lParam  = (LPARAM)(INT_PTR)-1;
+    TreeView_InsertItem(d->hwndTree, &dummy);
+    TreeView_Expand(d->hwndTree, hItem, TVE_EXPAND);
+}
+
+static LRESULT CALLBACK Ne_FtpBrowserProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+    NeFtpBrowserData* d = (NeFtpBrowserData*)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+    switch (msg) {
+    case WM_COMMAND: {
+        int id = LOWORD(wParam);
+        if (id == IDCANCEL || id == IDOK) { PostMessageW(hwnd, WM_CLOSE, 0, 0); return 0; }
+        if (id == 5001) {
+            // Refresh: reload selected dir (or its parent if a file is selected)
+            HTREEITEM hSel = TreeView_GetSelection(d->hwndTree);
+            HTREEITEM hRefItem = d->htiRoot;
+            int refIdx = 0;
+            if (hSel) {
+                TVITEMW ti = {}; ti.hItem = hSel; ti.mask = TVIF_PARAM;
+                TreeView_GetItem(d->hwndTree, &ti);
+                int idx = (int)(INT_PTR)ti.lParam;
+                if (idx >= 0 && idx < (int)d->nodes.size()) {
+                    if (d->nodes[idx].isDir) { hRefItem = hSel; refIdx = idx; }
+                    else {
+                        HTREEITEM hP = TreeView_GetParent(d->hwndTree, hSel);
+                        if (hP) {
+                            TVITEMW ti2 = {}; ti2.hItem = hP; ti2.mask = TVIF_PARAM;
+                            TreeView_GetItem(d->hwndTree, &ti2);
+                            hRefItem = hP;
+                            refIdx = (int)(INT_PTR)ti2.lParam;
+                        }
+                    }
+                }
+            }
+            if (hRefItem) Ne_FtpTreeReloadItem(hwnd, d, hRefItem, refIdx);
+            return 0;
+        }
+        // ── Save mode: "Save here" button ─────────────────────────────────────
+        if (id == 5002 && d->saveMode && d->hFilenameEdit) {
+            wchar_t fname[MAX_PATH] = {};
+            GetWindowTextW(d->hFilenameEdit, fname, MAX_PATH);
+            if (fname[0] == L'\0') {
+                MessageBoxW(hwnd, Ls(L"FTP_FILENAME_PROMPT"),
+                            Ls(L"FTP_SAVE_BROWSER"), MB_ICONWARNING|MB_OK);
+                SetFocus(d->hFilenameEdit);
+                return 0;
+            }
+            // Determine current directory from selected tree item
+            HTREEITEM hSel = TreeView_GetSelection(d->hwndTree);
+            std::wstring dir = L"/";
+            if (hSel) {
+                TVITEMW ti = {}; ti.hItem = hSel; ti.mask = TVIF_PARAM;
+                TreeView_GetItem(d->hwndTree, &ti);
+                int idx = (int)(INT_PTR)ti.lParam;
+                if (idx >= 0 && idx < (int)d->nodes.size()) {
+                    if (d->nodes[idx].isDir) {
+                        dir = d->nodes[idx].fullPath;
+                    } else {
+                        size_t sl = d->nodes[idx].fullPath.rfind(L'/');
+                        dir = (sl != std::wstring::npos && sl > 0)
+                              ? d->nodes[idx].fullPath.substr(0, sl) : L"/";
+                    }
+                }
+            }
+            if (!dir.empty() && dir.back() != L'/') dir += L'/';
+            d->pendingSaveRemotePath = dir + fname;
+            PostMessageW(hwnd, WM_CLOSE, 0, 0);
+            return 0;
+        }
+        return 0;
+    }
+    case WM_NOTIFY: {
+        NMHDR* hdr = (NMHDR*)lParam;
+        if (!d || hdr->hwndFrom != d->hwndTree) break;
+
+        if (hdr->code == TVN_ITEMEXPANDINGW) {
+            NMTREEVIEWW* nm = (NMTREEVIEWW*)lParam;
+            if (nm->action == TVE_EXPAND) {
+                int idx = (int)(INT_PTR)nm->itemNew.lParam;
+                if (idx >= 0 && idx < (int)d->nodes.size() && d->nodes[idx].isDir)
+                    Ne_FtpTreeLoadChildren(hwnd, nm->itemNew.hItem, d, idx);
+            }
+            break;
+        }
+
+        if (hdr->code == NM_DBLCLK) {
+            HTREEITEM hSel = TreeView_GetSelection(d->hwndTree);
+            if (!hSel) break;
+            TVITEMW ti = {}; ti.hItem = hSel; ti.mask = TVIF_PARAM;
+            TreeView_GetItem(d->hwndTree, &ti);
+            int idx = (int)(INT_PTR)ti.lParam;
+            if (idx < 0 || idx >= (int)d->nodes.size()) break;
+            // ── Save mode: double-click file → pre-fill filename ──────────────
+            if (d->saveMode) {
+                if (!d->nodes[idx].isDir && d->hFilenameEdit) {
+                    SetWindowTextW(d->hFilenameEdit, d->nodes[idx].name.c_str());
+                    SetFocus(d->hFilenameEdit);
+                }
+                break; // don't download
+            }
+            // ── Open mode: double-click file → download ───────────────────────
+            if (d->nodes[idx].isDir) break;
+            SetCursor(LoadCursorW(NULL, IDC_WAIT));
+            std::wstring localPath;
+            bool ok = NeFtp_DownloadToTemp(d->nodes[idx].fullPath, localPath);
+            SetCursor(LoadCursorW(NULL, IDC_ARROW));
+            if (ok) {
+                d->pendingOpenLocal  = localPath;
+                d->pendingOpenRemote = d->nodes[idx].fullPath;
+                PostMessageW(hwnd, WM_CLOSE, 0, 0);
+            } else {
+                MessageBoxW(hwnd, NeFtp_GetLastError().c_str(), Ls(L"FTP_DLG_BROWSER"), MB_ICONERROR|MB_OK);
+            }
+            break;
+        }
+
+        if (hdr->code == NM_RCLICK) {
+            POINT pt; GetCursorPos(&pt);
+            POINT ptC = pt; ScreenToClient(d->hwndTree, &ptC);
+            TVHITTESTINFO ht = {}; ht.pt = ptC;
+            HTREEITEM hHit = TreeView_HitTest(d->hwndTree, &ht);
+            int selIdx = -1;
+            if (hHit) {
+                TreeView_SelectItem(d->hwndTree, hHit);
+                TVITEMW ti = {}; ti.hItem = hHit; ti.mask = TVIF_PARAM;
+                TreeView_GetItem(d->hwndTree, &ti);
+                selIdx = (int)(INT_PTR)ti.lParam;
+            }
+            bool hasItem = (selIdx >= 0 && selIdx < (int)d->nodes.size());
+
+            HMENU hCtx = CreatePopupMenu();
+            AppendMenuW(hCtx, MF_STRING, 5020, Ls(L"FTP_CTX_NEW_FILE"));
+            AppendMenuW(hCtx, MF_STRING, 5021, Ls(L"FTP_CTX_NEW_DIR"));
+            if (hasItem) {
+                AppendMenuW(hCtx, MF_SEPARATOR, 0, NULL);
+                if (!d->nodes[selIdx].isDir && !d->saveMode)
+                    AppendMenuW(hCtx, MF_STRING, 5010, Ls(L"FTP_CTX_OPEN"));
+                AppendMenuW(hCtx, MF_STRING, 5011, Ls(L"FTP_CTX_CHMOD"));
+                if (selIdx > 0)
+                    AppendMenuW(hCtx, MF_STRING, 5012, Ls(L"FTP_CTX_DELETE"));
+            }
+
+            int cmd = TrackPopupMenuEx(hCtx, TPM_RETURNCMD|TPM_RIGHTBUTTON|TPM_NONOTIFY,
+                pt.x, pt.y, hwnd, NULL);
+            DestroyMenu(hCtx);
+            if (!cmd) break;
+
+            // Determine context directory and its tree item
+            std::wstring ctxDir;
+            HTREEITEM hCtxDirItem = nullptr;
+            int ctxDirIdx = 0;
+            if (hasItem) {
+                if (d->nodes[selIdx].isDir) {
+                    ctxDir = d->nodes[selIdx].fullPath;
+                    hCtxDirItem = hHit;
+                    ctxDirIdx = selIdx;
+                } else {
+                    size_t sl = d->nodes[selIdx].fullPath.rfind(L'/');
+                    ctxDir = (sl > 0) ? d->nodes[selIdx].fullPath.substr(0, sl) : L"/";
+                    hCtxDirItem = TreeView_GetParent(d->hwndTree, hHit);
+                    if (hCtxDirItem) {
+                        TVITEMW ti2 = {}; ti2.hItem = hCtxDirItem; ti2.mask = TVIF_PARAM;
+                        TreeView_GetItem(d->hwndTree, &ti2);
+                        ctxDirIdx = (int)(INT_PTR)ti2.lParam;
+                    }
+                }
+            } else {
+                ctxDir = L"/";
+                hCtxDirItem = d->htiRoot;
+                ctxDirIdx = 0;
+            }
+
+            if (cmd == 5020) {
+                std::wstring fname;
+                if (!Ne_ShowInputDialog(hwnd, Ls(L"FTP_CTX_NEW_FILE"), Ls(L"FTP_INPUT_FILENAME"), fname)) break;
+                std::wstring newPath = ctxDir;
+                if (newPath.back() != L'/') newPath += L'/';
+                newPath += fname;
+                SetCursor(LoadCursorW(NULL, IDC_WAIT));
+                bool ok = NeFtp_CreateEmptyFile(newPath);
+                SetCursor(LoadCursorW(NULL, IDC_ARROW));
+                if (!ok) { MessageBoxW(hwnd, NeFtp_GetLastError().c_str(), Ls(L"FTP_CTX_NEW_FILE"), MB_ICONERROR|MB_OK); break; }
+                if (hCtxDirItem) Ne_FtpTreeReloadItem(hwnd, d, hCtxDirItem, ctxDirIdx);
+
+            } else if (cmd == 5021) {
+                std::wstring dname;
+                if (!Ne_ShowInputDialog(hwnd, Ls(L"FTP_CTX_NEW_DIR"), Ls(L"FTP_INPUT_DIRNAME"), dname)) break;
+                std::wstring newPath = ctxDir;
+                if (newPath.back() != L'/') newPath += L'/';
+                newPath += dname;
+                SetCursor(LoadCursorW(NULL, IDC_WAIT));
+                bool ok = NeFtp_MkDir(newPath);
+                SetCursor(LoadCursorW(NULL, IDC_ARROW));
+                if (!ok) { MessageBoxW(hwnd, NeFtp_GetLastError().c_str(), Ls(L"FTP_CTX_NEW_DIR"), MB_ICONERROR|MB_OK); break; }
+                if (hCtxDirItem) Ne_FtpTreeReloadItem(hwnd, d, hCtxDirItem, ctxDirIdx);
+
+            } else if (cmd == 5010 && hasItem && !d->nodes[selIdx].isDir) {
+                SetCursor(LoadCursorW(NULL, IDC_WAIT));
+                std::wstring localPath;
+                bool ok = NeFtp_DownloadToTemp(d->nodes[selIdx].fullPath, localPath);
+                SetCursor(LoadCursorW(NULL, IDC_ARROW));
+                if (ok) {
+                    d->pendingOpenLocal  = localPath;
+                    d->pendingOpenRemote = d->nodes[selIdx].fullPath;
+                    PostMessageW(hwnd, WM_CLOSE, 0, 0);
+                } else {
+                    MessageBoxW(hwnd, NeFtp_GetLastError().c_str(), Ls(L"FTP_DLG_BROWSER"), MB_ICONERROR|MB_OK);
+                }
+
+            } else if (cmd == 5011 && hasItem) {
+                Ne_ShowChmodDialog(hwnd, d->nodes[selIdx].fullPath, -1);
+
+            } else if (cmd == 5012 && hasItem && selIdx > 0) {
+                wchar_t warnBuf[MAX_PATH + 64] = {};
+                swprintf_s(warnBuf, Ls(L"MSG_FTP_DELETE_WARN"), d->nodes[selIdx].name.c_str());
+                NeDialogButtonSpec btns[2] = {
+                    { IDYES,    Ls(L"BTN_OK"),     NeBtnTone::Red,  IDI_WARNING, 0 },
+                    { IDCANCEL, Ls(L"BTN_CANCEL"), NeBtnTone::Blue, IDI_ERROR,   0 },
+                };
+                int r = Ne_ShowChoiceDialog(hwnd, Ls(L"FTP_CTX_DELETE"), warnBuf, btns, 2, IDCANCEL);
+                if (r == IDYES) {
+                    SetCursor(LoadCursorW(NULL, IDC_WAIT));
+                    bool ok = NeFtp_Delete(d->nodes[selIdx].fullPath, d->nodes[selIdx].isDir);
+                    SetCursor(LoadCursorW(NULL, IDC_ARROW));
+                    if (!ok) {
+                        MessageBoxW(hwnd, NeFtp_GetLastError().c_str(), Ls(L"FTP_CTX_DELETE"), MB_ICONERROR|MB_OK);
+                    } else if (hCtxDirItem) {
+                        Ne_FtpTreeReloadItem(hwnd, d, hCtxDirItem, ctxDirIdx);
+                    }
+                }
+            }
+            break;
+        }
+        break;
+    }
+    case WM_DRAWITEM: {
+        DRAWITEMSTRUCT* dis = (DRAWITEMSTRUCT*)lParam;
+        if (d && Ne_ButtonIndexById(&d->dd, dis->CtlID) >= 0) {
+            Ne_DrawDialogButton(dis, &d->dd);
+            return TRUE;
+        }
+        return FALSE;
+    }
+    case WM_CLOSE:
+        PostQuitMessage(0);
+        DestroyWindow(hwnd);
+        return 0;
+    case WM_CTLCOLORSTATIC:
+    case WM_CTLCOLOREDIT:
+        SetBkColor((HDC)wParam, RGB(255,255,255));
+        return (LRESULT)GetStockObject(WHITE_BRUSH);
+    }
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+static void Ne_ShowFtpBrowser(HWND parent, int64_t profileId)
+{
+    if (!NeFtp_SetActiveConn(profileId)) return;
+
+    HINSTANCE hi = GetModuleHandleW(NULL);
+    WNDCLASSW wc = {}; wc.lpfnWndProc = Ne_FtpBrowserProc; wc.hInstance = hi;
+    wc.hbrBackground = (HBRUSH)(COLOR_WINDOW+1); wc.lpszClassName = L"NeFtpBrowserClass";
+    if (!GetClassInfoW(hi, L"NeFtpBrowserClass", &wc)) RegisterClassW(&wc);
+
+    const int W = S(480), H = S(580);
+    RECT pr = {}; if (parent && IsWindow(parent)) GetWindowRect(parent, &pr);
+    int x = (pr.left+pr.right)/2 - W/2, y = (pr.top+pr.bottom)/2 - H/2;
+    if (y < 30) y = 30;
+
+    NeFtpBrowserData d = {};
+    d.hwndParent = parent;
+    d.profileId  = profileId;
+
+    std::wstring title = std::wstring(Ls(L"FTP_DLG_BROWSER"))
+                       + L" \u2014 " + NeFtp_GetActiveProfile().friendlyName;
+
+    HWND dlg = CreateWindowExW(WS_EX_DLGMODALFRAME|WS_EX_WINDOWEDGE,
+        L"NeFtpBrowserClass", title.c_str(),
+        WS_POPUP|WS_CAPTION|WS_SYSMENU|WS_VISIBLE,
+        x, y, W, H, parent, NULL, hi, NULL);
+    if (!dlg) return;
+
+    SetWindowLongPtrW(dlg, GWLP_USERDATA, (LONG_PTR)&d);
+
+    HICON hIco = LoadIconW(hi, MAKEINTRESOURCEW(IDI_APPICON));
+    if (hIco) { SendMessageW(dlg, WM_SETICON, ICON_SMALL, (LPARAM)hIco);
+                SendMessageW(dlg, WM_SETICON, ICON_BIG,   (LPARAM)hIco); }
+
+    RECT rc; GetClientRect(dlg, &rc);
+    const int PAD = S(10), BTN_H = S(32);
+    HFONT hFont = Ne_CreateDialogFont(false);
+
+    // System imagelist for file-type icons
+    SHFILEINFOW sfi = {};
+    HIMAGELIST hSysImgList = (HIMAGELIST)SHGetFileInfoW(L"C:\\", 0, &sfi, sizeof(sfi),
+        SHGFI_SYSICONINDEX | SHGFI_SMALLICON);
+    SHGetFileInfoW(L"x", FILE_ATTRIBUTE_DIRECTORY, &sfi, sizeof(sfi),
+        SHGFI_USEFILEATTRIBUTES | SHGFI_SYSICONINDEX | SHGFI_SMALLICON);
+    d.iFolderClosed = sfi.iIcon;
+    SHGetFileInfoW(L"x", FILE_ATTRIBUTE_DIRECTORY, &sfi, sizeof(sfi),
+        SHGFI_USEFILEATTRIBUTES | SHGFI_SYSICONINDEX | SHGFI_SMALLICON | SHGFI_OPENICON);
+    d.iFolderOpen = sfi.iIcon;
+
+    // Toolbar + Close buttons stored in dd for owner-draw
+    d.dd.buttonCount = 2;
+    d.dd.buttons[0] = { 5001, Ls(L"BTN_RELOAD"), NeBtnTone::Blue, IDI_INFORMATION,
+                         Ne_MeasureButtonWidth(Ls(L"BTN_RELOAD")) };
+    d.dd.buttons[1] = { IDOK, Ls(L"BTN_CLOSE"),  NeBtnTone::Red,  IDI_ERROR,
+                         Ne_MeasureButtonWidth(Ls(L"BTN_CLOSE")) };
+
+    // Refresh button (top-right)
+    {
+        int bw = d.dd.buttons[0].width;
+        HWND hBtn = CreateWindowExW(0, L"BUTTON", d.dd.buttons[0].text.c_str(),
+            WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_OWNERDRAW,
+            rc.right - PAD - bw, PAD, bw, BTN_H,
+            dlg, (HMENU)(UINT_PTR)5001, hi, NULL);
+        SendMessageW(hBtn, WM_SETFONT, (WPARAM)hFont, TRUE);
+        WNDPROC prev = (WNDPROC)SetWindowLongPtrW(hBtn, GWLP_WNDPROC, (LONG_PTR)Ne_BtnHoverProc);
+        SetPropW(hBtn, L"NePrevProc", (HANDLE)prev);
+    }
+
+    // TreeView
+    int treeY = PAD + BTN_H + S(6);
+    int treeH = rc.bottom - treeY - PAD - BTN_H - S(8);
+    d.hwndTree = CreateWindowExW(WS_EX_CLIENTEDGE, WC_TREEVIEWW, L"",
+        WS_CHILD|WS_VISIBLE|WS_TABSTOP|
+        TVS_HASLINES|TVS_HASBUTTONS|TVS_LINESATROOT|TVS_SHOWSELALWAYS,
+        PAD, treeY, rc.right - 2*PAD, treeH, dlg, (HMENU)5005, hi, NULL);
+    if (hSysImgList)
+        TreeView_SetImageList(d.hwndTree, hSysImgList, TVSIL_NORMAL);
+    SendMessageW(d.hwndTree, WM_SETFONT, (WPARAM)hFont, TRUE);
+
+    // Close button (bottom-centre)
+    {
+        int bw = d.dd.buttons[1].width;
+        HWND hBtn = CreateWindowExW(0, L"BUTTON", d.dd.buttons[1].text.c_str(),
+            WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_OWNERDRAW,
+            (rc.right - bw) / 2, rc.bottom - PAD - BTN_H, bw, BTN_H,
+            dlg, (HMENU)IDOK, hi, NULL);
+        SendMessageW(hBtn, WM_SETFONT, (WPARAM)hFont, TRUE);
+        WNDPROC prev = (WNDPROC)SetWindowLongPtrW(hBtn, GWLP_WNDPROC, (LONG_PTR)Ne_BtnHoverProc);
+        SetPropW(hBtn, L"NePrevProc", (HANDLE)prev);
+    }
+
+    // Seed root node
+    {
+        std::wstring rootPath = NeFtp_GetActiveProfile().initialPath;
+        if (rootPath.empty()) rootPath = L"/";
+        NeFtpTreeNode rootNode;
+        rootNode.name     = rootPath;
+        rootNode.fullPath = rootPath;
+        rootNode.isDir    = true;
+        rootNode.loaded   = false;
+        d.nodes.push_back(rootNode);
+        d.htiRoot = Ne_FtpTreeAddItem(d.hwndTree, TVI_ROOT, rootPath, true, 0,
+                                       d.iFolderClosed, d.iFolderOpen);
+        // Expand root immediately
+        TreeView_Expand(d.hwndTree, d.htiRoot, TVE_EXPAND);
+    }
+
+    if (parent && IsWindow(parent)) EnableWindow(parent, FALSE);
+    MSG m;
+    while (GetMessageW(&m, NULL, 0, 0)) {
+        if (!IsDialogMessageW(dlg, &m)) { TranslateMessage(&m); DispatchMessageW(&m); }
+    }
+    if (parent && IsWindow(parent)) { EnableWindow(parent, TRUE); SetForegroundWindow(parent); }
+    DeleteObject(hFont);
+
+    if (!d.pendingOpenLocal.empty()) {
+        NeTabs_AddUntitled(parent);
+        Ne_LoadPathIntoEditor(parent, d.pendingOpenLocal);
+        NeTabDoc* doc = NeTabs_GetActiveDoc(parent);
+        if (doc) {
+            doc->isFtpFile        = true;
+            doc->ftpProfileId     = d.profileId;
+            doc->ftpRemotePath    = d.pendingOpenRemote;
+            doc->ftpFriendlyName  = NeFtp_GetActiveProfile().friendlyName;
+        }
+    }
+}
+
+// Opens the FTP browser in "save" mode. Returns the chosen remote path, or
+// empty string if the user cancelled. Does NOT close the connection.
+static std::wstring Ne_ShowFtpBrowserSave(HWND parent, int64_t profileId,
+                                          const std::wstring& suggestedName)
+{
+    if (!NeFtp_SetActiveConn(profileId)) return L"";
+
+    HINSTANCE hi = GetModuleHandleW(NULL);
+    WNDCLASSW wc = {}; wc.lpfnWndProc = Ne_FtpBrowserProc; wc.hInstance = hi;
+    wc.hbrBackground = (HBRUSH)(COLOR_WINDOW+1); wc.lpszClassName = L"NeFtpBrowserClass";
+    if (!GetClassInfoW(hi, L"NeFtpBrowserClass", &wc)) RegisterClassW(&wc);
+
+    const int W = S(480), H = S(620);
+    RECT pr = {}; if (parent && IsWindow(parent)) GetWindowRect(parent, &pr);
+    int x = (pr.left+pr.right)/2 - W/2, y = (pr.top+pr.bottom)/2 - H/2;
+    if (y < 30) y = 30;
+
+    NeFtpBrowserData d = {};
+    d.hwndParent = parent;
+    d.profileId  = profileId;
+    d.saveMode   = true;
+
+    std::wstring title = std::wstring(Ls(L"FTP_SAVE_BROWSER"))
+                       + L" \u2014 " + NeFtp_GetActiveProfile().friendlyName;
+
+    HWND dlg = CreateWindowExW(WS_EX_DLGMODALFRAME|WS_EX_WINDOWEDGE,
+        L"NeFtpBrowserClass", title.c_str(),
+        WS_POPUP|WS_CAPTION|WS_SYSMENU|WS_VISIBLE,
+        x, y, W, H, parent, NULL, hi, NULL);
+    if (!dlg) return L"";
+
+    SetWindowLongPtrW(dlg, GWLP_USERDATA, (LONG_PTR)&d);
+
+    HICON hIco = LoadIconW(hi, MAKEINTRESOURCEW(IDI_APPICON));
+    if (hIco) { SendMessageW(dlg, WM_SETICON, ICON_SMALL, (LPARAM)hIco);
+                SendMessageW(dlg, WM_SETICON, ICON_BIG,   (LPARAM)hIco); }
+
+    RECT rc; GetClientRect(dlg, &rc);
+    const int PAD = S(10), BTN_H = S(32), EDIT_H = S(26), LABEL_H = S(18);
+    HFONT hFont = Ne_CreateDialogFont(false);
+
+    // System imagelist for file-type icons
+    SHFILEINFOW sfi = {};
+    HIMAGELIST hSysImgList = (HIMAGELIST)SHGetFileInfoW(L"C:\\", 0, &sfi, sizeof(sfi),
+        SHGFI_SYSICONINDEX | SHGFI_SMALLICON);
+    SHGetFileInfoW(L"x", FILE_ATTRIBUTE_DIRECTORY, &sfi, sizeof(sfi),
+        SHGFI_USEFILEATTRIBUTES | SHGFI_SYSICONINDEX | SHGFI_SMALLICON);
+    d.iFolderClosed = sfi.iIcon;
+    SHGetFileInfoW(L"x", FILE_ATTRIBUTE_DIRECTORY, &sfi, sizeof(sfi),
+        SHGFI_USEFILEATTRIBUTES | SHGFI_SYSICONINDEX | SHGFI_SMALLICON | SHGFI_OPENICON);
+    d.iFolderOpen = sfi.iIcon;
+
+    // Buttons: Refresh (top-right) + Save here (bottom) + Cancel (bottom)
+    d.dd.buttonCount = 3;
+    d.dd.buttons[0] = { 5001, Ls(L"BTN_RELOAD"),      NeBtnTone::Blue, IDI_INFORMATION,
+                         Ne_MeasureButtonWidth(Ls(L"BTN_RELOAD")) };
+    d.dd.buttons[1] = { 5002, Ls(L"FTP_SAVE_HERE"),   NeBtnTone::Green, IDI_INFORMATION,
+                         Ne_MeasureButtonWidth(Ls(L"FTP_SAVE_HERE")) };
+    d.dd.buttons[2] = { IDOK, Ls(L"BTN_CANCEL"),      NeBtnTone::Red,  IDI_ERROR,
+                         Ne_MeasureButtonWidth(Ls(L"BTN_CANCEL")) };
+
+    // Refresh button (top-right)
+    {
+        int bw = d.dd.buttons[0].width;
+        HWND hBtn = CreateWindowExW(0, L"BUTTON", d.dd.buttons[0].text.c_str(),
+            WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_OWNERDRAW,
+            rc.right - PAD - bw, PAD, bw, BTN_H,
+            dlg, (HMENU)(UINT_PTR)5001, hi, NULL);
+        SendMessageW(hBtn, WM_SETFONT, (WPARAM)hFont, TRUE);
+        WNDPROC prev = (WNDPROC)SetWindowLongPtrW(hBtn, GWLP_WNDPROC, (LONG_PTR)Ne_BtnHoverProc);
+        SetPropW(hBtn, L"NePrevProc", (HANDLE)prev);
+    }
+
+    // Filename row: label + edit box (above bottom buttons)
+    int fnRowY = rc.bottom - PAD - BTN_H - S(6) - EDIT_H - S(4) - LABEL_H;
+    {
+        HWND hLbl = CreateWindowExW(0, L"STATIC", Ls(L"FTP_FILENAME_PROMPT"),
+            WS_CHILD|WS_VISIBLE|SS_LEFT,
+            PAD, fnRowY, rc.right - 2*PAD, LABEL_H,
+            dlg, NULL, hi, NULL);
+        SendMessageW(hLbl, WM_SETFONT, (WPARAM)hFont, TRUE);
+
+        d.hFilenameEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", suggestedName.c_str(),
+            WS_CHILD|WS_VISIBLE|WS_TABSTOP|ES_AUTOHSCROLL,
+            PAD, fnRowY + LABEL_H + S(2), rc.right - 2*PAD, EDIT_H,
+            dlg, (HMENU)(UINT_PTR)5003, hi, NULL);
+        SendMessageW(d.hFilenameEdit, WM_SETFONT, (WPARAM)hFont, TRUE);
+    }
+
+    // TreeView (fills between top buttons and filename row)
+    int treeY = PAD + BTN_H + S(6);
+    int treeH = fnRowY - treeY - S(4);
+    d.hwndTree = CreateWindowExW(WS_EX_CLIENTEDGE, WC_TREEVIEWW, L"",
+        WS_CHILD|WS_VISIBLE|WS_TABSTOP|
+        TVS_HASLINES|TVS_HASBUTTONS|TVS_LINESATROOT|TVS_SHOWSELALWAYS,
+        PAD, treeY, rc.right - 2*PAD, treeH, dlg, (HMENU)5005, hi, NULL);
+    if (hSysImgList)
+        TreeView_SetImageList(d.hwndTree, hSysImgList, TVSIL_NORMAL);
+    SendMessageW(d.hwndTree, WM_SETFONT, (WPARAM)hFont, TRUE);
+
+    // Bottom buttons: "Save here" and "Cancel" side by side
+    {
+        int bSave   = d.dd.buttons[1].width;
+        int bCancel = d.dd.buttons[2].width;
+        int totalW  = bSave + PAD + bCancel;
+        int btnY    = rc.bottom - PAD - BTN_H;
+        int startX  = (rc.right - totalW) / 2;
+
+        HWND hSave = CreateWindowExW(0, L"BUTTON", d.dd.buttons[1].text.c_str(),
+            WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_OWNERDRAW,
+            startX, btnY, bSave, BTN_H,
+            dlg, (HMENU)(UINT_PTR)5002, hi, NULL);
+        SendMessageW(hSave, WM_SETFONT, (WPARAM)hFont, TRUE);
+        WNDPROC p1 = (WNDPROC)SetWindowLongPtrW(hSave, GWLP_WNDPROC, (LONG_PTR)Ne_BtnHoverProc);
+        SetPropW(hSave, L"NePrevProc", (HANDLE)p1);
+
+        HWND hCancel = CreateWindowExW(0, L"BUTTON", d.dd.buttons[2].text.c_str(),
+            WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_OWNERDRAW,
+            startX + bSave + PAD, btnY, bCancel, BTN_H,
+            dlg, (HMENU)IDOK, hi, NULL);
+        SendMessageW(hCancel, WM_SETFONT, (WPARAM)hFont, TRUE);
+        WNDPROC p2 = (WNDPROC)SetWindowLongPtrW(hCancel, GWLP_WNDPROC, (LONG_PTR)Ne_BtnHoverProc);
+        SetPropW(hCancel, L"NePrevProc", (HANDLE)p2);
+    }
+
+    // Seed root node
+    {
+        std::wstring rootPath = NeFtp_GetActiveProfile().initialPath;
+        if (rootPath.empty()) rootPath = L"/";
+        NeFtpTreeNode rootNode;
+        rootNode.name     = rootPath;
+        rootNode.fullPath = rootPath;
+        rootNode.isDir    = true;
+        rootNode.loaded   = false;
+        d.nodes.push_back(rootNode);
+        d.htiRoot = Ne_FtpTreeAddItem(d.hwndTree, TVI_ROOT, rootPath, true, 0,
+                                       d.iFolderClosed, d.iFolderOpen);
+        TreeView_Expand(d.hwndTree, d.htiRoot, TVE_EXPAND);
+    }
+
+    if (parent && IsWindow(parent)) EnableWindow(parent, FALSE);
+    MSG m;
+    while (GetMessageW(&m, NULL, 0, 0)) {
+        if (!IsDialogMessageW(dlg, &m)) { TranslateMessage(&m); DispatchMessageW(&m); }
+    }
+    if (parent && IsWindow(parent)) { EnableWindow(parent, TRUE); SetForegroundWindow(parent); }
+    DeleteObject(hFont);
+
+    return d.pendingSaveRemotePath; // empty = cancelled
+}
+
 static void ShowNsbCreditsDialog(HWND parent)
 {
     HINSTANCE hi = GetModuleHandleW(NULL);
@@ -5055,6 +6946,36 @@ static void ShowNsbCreditsDialog(HWND parent)
         L"MinGW-W64 GCC 15.2.0.\r\n\r\n",
         false, RGB(40,40,40), 0, false);
     AppendNsbRich(hEdit, L"https://www.mingw-w64.org/\r\n", false, RGB(0,80,160), 0, false);
+
+    // ── SQLite3 ───────────────────────────────────────────────────────────────
+    AppendNsbRich(hEdit,
+        L"\r\n=================================================\r\n",
+        false, RGB(100,100,100), 9, true);
+    AppendNsbRich(hEdit, L"SQLITE3\r\n", true, RGB(0,100,80), 18, true);
+    AppendNsbRich(hEdit,
+        L"\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\r\n",
+        false, RGB(0,100,80), 0, true);
+    AppendNsbRich(hEdit,
+        L"SQLite is a small, fast, self-contained SQL database engine in the public domain. "
+        L"NSBEdit uses the SQLite amalgamation to store FTP/SFTP connection profiles.\r\n\r\n",
+        false, RGB(40,40,40), 0, false);
+    AppendNsbRich(hEdit, L"https://www.sqlite.org/\r\n", false, RGB(0,80,160), 0, false);
+
+    // ── libcurl + libssh2 ─────────────────────────────────────────────────────
+    AppendNsbRich(hEdit,
+        L"\r\n=================================================\r\n",
+        false, RGB(100,100,100), 9, true);
+    AppendNsbRich(hEdit, L"LIBCURL / LIBSSH2\r\n", true, RGB(0,60,180), 18, true);
+    AppendNsbRich(hEdit,
+        L"\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\r\n",
+        false, RGB(0,60,180), 0, true);
+    AppendNsbRich(hEdit,
+        L"libcurl is a free, open-source URL transfer library by Daniel Stenberg. "
+        L"libssh2 is an open-source SSH2 protocol library. "
+        L"NSBEdit uses both to implement FTP and SFTP file transfer for remote editing.\r\n\r\n",
+        false, RGB(40,40,40), 0, false);
+    AppendNsbRich(hEdit, L"https://curl.se/\r\n", false, RGB(0,80,160), 0, false);
+    AppendNsbRich(hEdit, L"https://libssh2.org/\r\n", false, RGB(0,80,160), 0, false);
 
     SendMessageW(hEdit, EM_SETSEL, 0, 0);
     SendMessageW(hEdit, EM_SCROLLCARET, 0, 0);
@@ -5232,6 +7153,18 @@ static LRESULT CALLBACK Ne_WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
         st->pad      = S(8);
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)st);
 
+        // ── Register line-number gutter window class (once per process) ───────
+        {
+            WNDCLASSEXW wc = {};
+            wc.cbSize        = sizeof(wc);
+            wc.lpfnWndProc   = NsbLineGutterProc;
+            wc.hInstance     = hInst;
+            wc.hCursor       = LoadCursorW(NULL, IDC_ARROW);
+            wc.hbrBackground = NULL;
+            wc.lpszClassName = L"NsbLineGutter";
+            RegisterClassExW(&wc); // harmless if already registered
+        }
+
         // ── Tooltip system ────────────────────────────────────────────────────
         InitTooltipSystem(hInst);
 
@@ -5259,6 +7192,8 @@ static LRESULT CALLBACK Ne_WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
             wcscpy_s(lf.lfFaceName, L"Segoe UI");
             g_hMenuFont = CreateFontIndirectW(&lf);
         }
+        if (!g_hFtpMenuIcon)
+            ExtractIconExW(L"shell32.dll", 150, NULL, &g_hFtpMenuIcon, 1);
 
         // ── File menu ─────────────────────────────────────────────────────────
         HMENU hFile  = CreatePopupMenu();
@@ -5266,6 +7201,7 @@ static LRESULT CALLBACK Ne_WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
         Ne_AppendMenuOD(hFile, MF_STRING,    IDM_OPEN,       Ls(L"MENU_OPEN"));
         Ne_AppendMenuOD(hFile, MF_STRING,    IDM_SAVE,       Ls(L"MENU_SAVE"));
         Ne_AppendMenuOD(hFile, MF_STRING,    IDM_SAVEAS,     Ls(L"MENU_SAVEAS"));
+        Ne_AppendMenuOD(hFile, MF_STRING,    IDM_SAVE_TO_FTP, Ls(L"MENU_SAVE_TO_FTP"));
         Ne_AppendMenuOD(hFile, MF_SEPARATOR, 0,              NULL);
         Ne_AppendMenuOD(hFile, MF_STRING,    IDM_PRINT,      Ls(L"MENU_PRINT"));
         Ne_AppendMenuOD(hFile, MF_STRING,    IDM_EXPORT_PDF, Ls(L"MENU_EXPORT_PDF"));
@@ -5303,6 +7239,9 @@ static LRESULT CALLBACK Ne_WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
         for (int li = 0; li < NE_LANG_COUNT; ++li)
             Ne_AppendMenuOD(s_hLangMenu, MF_STRING, IDM_LANG_BASE + li, s_langs[li].name);
         Ne_AppendMenuOD(hMenu, MF_POPUP, (UINT_PTR)s_hLangMenu, L"Language", true);
+        // ── FTP menu ──────────────────────────────────────────────────────────
+        s_hFtpMenu = CreatePopupMenu();
+        Ne_AppendMenuOD(hMenu, MF_POPUP, (UINT_PTR)s_hFtpMenu, Ls(L"MENU_FTP"), true);
         // ── Help menu ─────────────────────────────────────────────────────────
         HMENU hHelp = CreatePopupMenu();
         Ne_AppendMenuOD(hHelp, MF_STRING,    IDM_SHORTCUTS, Ls(L"MENU_SHORTCUTS"));
@@ -5369,9 +7308,14 @@ static LRESULT CALLBACK Ne_WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
             HDC hdc = GetDC(hwnd);
             EnumFontFamiliesExW(hdc, &lf, Ne_FontEnumProc, (LPARAM)&fonts, 0);
             ReleaseDC(hwnd, hdc);
+            // Sort alphabetically, remove duplicates
             std::sort(fonts.begin(), fonts.end(), [](const std::wstring& a, const std::wstring& b){
                 return _wcsicmp(a.c_str(), b.c_str()) < 0;
             });
+            fonts.erase(std::unique(fonts.begin(), fonts.end(), [](const std::wstring& a, const std::wstring& b){
+                return _wcsicmp(a.c_str(), b.c_str()) == 0;
+            }), fonts.end());
+            // Segoe UI pinned at top (index 0) as the default, then the rest alphabetically
             const wchar_t* defFace = L"Segoe UI";
             SendMessageW(hFace, CB_ADDSTRING, 0, (LPARAM)defFace);
             for (auto& fn : fonts)
@@ -5484,6 +7428,8 @@ static LRESULT CALLBACK Ne_WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
             WS_CHILD|WS_VISIBLE|BS_OWNERDRAW,
             0, 0, wXs, bSz, hwnd, (HMENU)(UINT_PTR)IDC_NE_CASE, hInst, NULL);
 
+        // IDC_BTN_LINENUM toolbar button removed — toggle lives in the gutter strip
+
         HWND hParSpBtn = CreateWindowExW(0, L"BUTTON", L"\u00B6\u2195",
             WS_CHILD|WS_VISIBLE|BS_OWNERDRAW,
             0, 0, wXs, bSz, hwnd, (HMENU)(UINT_PTR)IDC_NE_PARSPACE, hInst, NULL);
@@ -5517,6 +7463,7 @@ static LRESULT CALLBACK Ne_WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
         tp.untitledLabel = Ls(L"UNTITLED");
         NeTabs_Create(tp);
         NeTabs_SetContextLabels(hwnd, Ls(L"TAB_CTX_NEW_TAB"), Ls(L"TAB_CTX_CLOSE_TAB"));
+        st->editX = pad; st->editW = cW - 2 * pad; st->editH = std::max(1, editH);
         NeTabs_SetRects(hwnd,
             pad, st->tabY, cW - 2 * pad, st->tabH,
             pad, editY, cW - 2 * pad, std::max(1, editH));
@@ -5532,14 +7479,15 @@ static LRESULT CALLBACK Ne_WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
             wcsncpy_s(cfD.szFaceName, L"Segoe UI", LF_FACESIZE - 1);
             SendMessageW(hEdit, EM_SETCHARFORMAT, SCF_ALL, (LPARAM)&cfD);
             SendMessageW(hEdit, EM_SETBKGNDCOLOR, 0, RGB(255, 255, 255));
-            SendMessageW(hEdit, EM_SETEVENTMASK, 0, ENM_CHANGE | ENM_SELCHANGE | ENM_LINK);
+            SendMessageW(hEdit, EM_SETEVENTMASK, 0, ENM_CHANGE | ENM_SELCHANGE | ENM_LINK | ENM_SCROLL);
             Ne_SubclassEditForCaret(hEdit);
             SendMessageW(hEdit, EM_SETEVENTMASK, 0, ENM_SELCHANGE);  // suppress EN_CHANGE during attach
             Ne_AttachScrollbars(hEdit);
-            SendMessageW(hEdit, EM_SETEVENTMASK, 0, ENM_CHANGE | ENM_SELCHANGE | ENM_LINK);
+            SendMessageW(hEdit, EM_SETEVENTMASK, 0, ENM_CHANGE | ENM_SELCHANGE | ENM_LINK | ENM_SCROLL);
         }
 
         Ne_SyncScrollbarVisibility(hwnd);
+        Ne_SyncRichGutters(hwnd);
 
         // ── Apply system font to toolbar buttons / combos ─────────────────────
         NONCLIENTMETRICSW ncm = {}; ncm.cbSize = sizeof(ncm);
@@ -5637,9 +7585,12 @@ static LRESULT CALLBACK Ne_WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
 
         int editH  = cH - newEditY - st->statusH - S(2);
         if (editH > 0) {
+            int editX = pad, editW = cW - 2 * pad;
+            st->editX = editX; st->editW = editW; st->editH = editH;
             NeTabs_SetRects(hwnd,
                 pad, st->tabY, cW - 2 * pad, st->tabH,
-                pad, newEditY, cW - 2 * pad, editH);
+                editX, newEditY, editW, editH);
+            Ne_SyncRichGutters(hwnd);
             Ne_SyncScrollbarVisibility(hwnd);
         }
         return 0;
@@ -5665,6 +7616,102 @@ static LRESULT CALLBACK Ne_WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
         if (wmId == IDM_OPEN)       { Ne_Open(hwnd);              return 0; }
         if (wmId == IDM_SAVE)       { Ne_Save(hwnd);              return 0; }
         if (wmId == IDM_SAVEAS)     { Ne_SaveAs(hwnd);            return 0; }
+        if (wmId == IDM_SAVE_TO_FTP) {
+            // ── Save current document to an FTP server ────────────────────────
+            // 1. Collect connected profiles so user can pick a server
+            std::vector<NeProfile> ftpProfiles;
+            NeProfiles_List(ftpProfiles);
+            std::vector<NeProfile> connected;
+            for (auto& p : ftpProfiles)
+                if (NeFtp_IsConnected(p.id)) connected.push_back(p);
+
+            if (connected.empty()) {
+                NeDialogButtonSpec btn = { IDOK, Ls(L"BTN_OK"), NeBtnTone::Red, IDI_ERROR, 0 };
+                Ne_ShowChoiceDialog(hwnd, Ls(L"FTP_CONN_FAILED"),
+                                    Ls(L"FTP_STATUS"), &btn, 1, IDOK);
+                return 0;
+            }
+
+            // If exactly one connected server, use it; otherwise ask which one
+            int64_t chosenId = connected[0].id;
+            if (connected.size() > 1) {
+                // Build a simple choice dialog listing server names
+                // (Use at most 3 servers to fit the dialog button limit)
+                int n = std::min((int)connected.size(), 3);
+                NeDialogButtonSpec btns[3];
+                for (int i = 0; i < n; ++i)
+                    btns[i] = { 2000 + i, connected[i].friendlyName, NeBtnTone::Blue,
+                                IDI_INFORMATION, Ne_MeasureButtonWidth(connected[i].friendlyName) };
+                int r = Ne_ShowChoiceDialog(hwnd, Ls(L"FTP_SAVE_BROWSER"),
+                                            Ls(L"FTP_SAVE_BROWSER"), btns, n, IDCANCEL);
+                bool found = false;
+                for (int i = 0; i < n; ++i)
+                    if (r == 2000 + i) { chosenId = connected[i].id; found = true; break; }
+                if (!found) return 0;
+            }
+
+            // 2. Save doc to temp file
+            NeTabDoc* doc = NeTabs_GetActiveDoc(hwnd);
+            if (!doc) return 0;
+            std::wstring tempPath;
+            {
+                wchar_t tmp[MAX_PATH] = {};
+                GetTempPathW(MAX_PATH, tmp);
+                std::wstring dir = std::wstring(tmp) + L"NSBEdit_savelocal";
+                CreateDirectoryW(dir.c_str(), NULL);
+                // Derive suggested filename
+                std::wstring fname = L"untitled";
+                if (!doc->path.empty()) {
+                    size_t sl = doc->path.rfind(L'\\');
+                    if (sl == std::wstring::npos) sl = doc->path.rfind(L'/');
+                    fname = (sl != std::wstring::npos) ? doc->path.substr(sl+1) : doc->path;
+                } else if (!doc->ftpRemotePath.empty()) {
+                    size_t sl = doc->ftpRemotePath.rfind(L'/');
+                    fname = (sl != std::wstring::npos) ? doc->ftpRemotePath.substr(sl+1)
+                                                        : doc->ftpRemotePath;
+                }
+                tempPath = dir + L"\\" + fname;
+                if (!Ne_SaveToPath(hwnd, tempPath)) return 0;
+            }
+            std::wstring suggestName;
+            {
+                size_t sl = tempPath.rfind(L'\\');
+                suggestName = (sl != std::wstring::npos) ? tempPath.substr(sl+1) : tempPath;
+            }
+
+            // 3. Open browser in save mode to pick destination
+            std::wstring remoteDest = Ne_ShowFtpBrowserSave(hwnd, chosenId, suggestName);
+            if (remoteDest.empty()) return 0; // cancelled
+
+            // 4. Upload
+            NeFtp_SetActiveConn(chosenId);
+            SetCursor(LoadCursorW(NULL, IDC_WAIT));
+            bool ok = NeFtp_Upload(tempPath, remoteDest);
+            SetCursor(LoadCursorW(NULL, IDC_ARROW));
+            if (!ok) {
+                NeDialogButtonSpec btn = { IDOK, Ls(L"BTN_OK"), NeBtnTone::Red, IDI_ERROR, 0 };
+                Ne_ShowChoiceDialog(hwnd, Ls(L"FTP_CONN_FAILED"),
+                                    NeFtp_GetLastError(), &btn, 1, IDOK);
+                return 0;
+            }
+
+            // 5. Mark doc as FTP-linked and show success (connection kept open)
+            if (doc) {
+                doc->isFtpFile       = true;
+                doc->ftpProfileId    = chosenId;
+                doc->ftpRemotePath   = remoteDest;
+                NeFtp_SetActiveConn(chosenId);
+                doc->ftpFriendlyName = NeFtp_GetActiveProfile().friendlyName;
+                doc->modified        = false;
+                NeTabs_UpdateTabTitle(hwnd, NeTabs_GetActiveIndex(hwnd));
+                Ne_UpdateTitle(hwnd);
+            }
+            NeDialogButtonSpec okBtn = { IDOK, Ls(L"BTN_OK"), NeBtnTone::Green,
+                                         IDI_INFORMATION, 0 };
+            Ne_ShowChoiceDialog(hwnd, Ls(L"FTP_SAVE_TO"),
+                                Ls(L"FTP_SAVED_OK"), &okBtn, 1, IDOK);
+            return 0;
+        }
         if (wmId == IDM_EXIT)       { PostMessageW(hwnd, WM_CLOSE, 0, 0); return 0; }
         if (wmId == IDM_PRINT)      { Ne_Print(hwnd);             return 0; }
         if (wmId == IDM_EXPORT_PDF) { Ne_ExportPdf(hwnd);         return 0; }
@@ -5672,13 +7719,50 @@ static LRESULT CALLBACK Ne_WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
         if (wmId >= IDM_LANG_BASE && wmId < IDM_LANG_BASE + NE_LANG_COUNT) {
             int newLang = wmId - IDM_LANG_BASE;
             NeTabDoc* doc = NeTabs_GetActiveDoc(hwnd);
-            if (doc && doc->hSci) {
-                doc->langId = newLang;
-                doc->langUserSet = true;
-                Ne_SetScintillaLexer(doc->hSci, s_langs[newLang].lexer);
-                Ne_UpdateLangMenuCheck(newLang);
-                Ne_UpdateStatusText(hwnd);
+            if (!doc) return 0;
+
+            // If the current tab is a RichEdit (no Scintilla yet), switch it to
+            // a Scintilla tab now — grab the plain text first, then create Sci.
+            if (!doc->hSci) {
+                HWND hEdit = doc->hEdit;
+                // Extract plain text from RichEdit as wide string.
+                int wlen = GetWindowTextLengthW(hEdit);
+                std::wstring wide(wlen, L'\0');
+                if (wlen > 0) GetWindowTextW(hEdit, wide.data(), wlen + 1);
+                // Convert to UTF-8 for Scintilla.
+                std::string utf8;
+                if (!wide.empty()) {
+                    int u8len = WideCharToMultiByte(CP_UTF8, 0, wide.data(), (int)wide.size(),
+                                                    NULL, 0, NULL, NULL);
+                    if (u8len > 0) {
+                        utf8.resize(u8len);
+                        WideCharToMultiByte(CP_UTF8, 0, wide.data(), (int)wide.size(),
+                                            utf8.data(), u8len, NULL, NULL);
+                    }
+                }
+                // Create Scintilla at the same position as hEdit.
+                RECT rcEdit; GetWindowRect(hEdit, &rcEdit);
+                POINT pt = { rcEdit.left, rcEdit.top };
+                ScreenToClient(hwnd, &pt);
+                int w = rcEdit.right - rcEdit.left;
+                int h = rcEdit.bottom - rcEdit.top;
+                doc->hSci = Ne_CreateScintilla(hwnd, pt.x, pt.y, w, h);
+                if (!doc->hSci) return 0;
+                SendMessageW(doc->hSci, SCI_SETTEXT, 0, (LPARAM)utf8.c_str());
+                SendMessageW(doc->hSci, SCI_EMPTYUNDOBUFFER, 0, 0);
+                SendMessageW(doc->hSci, SCI_SETSAVEPOINT, 0, 0);
+                SendMessageW(doc->hSci, SCI_SETZOOM, (WPARAM)g_zoomSci, 0);
+                ShowWindow(hEdit, SW_HIDE);
+                ShowWindow(doc->hSci, SW_SHOW);
+                SetFocus(doc->hSci);
             }
+
+            doc->langId = newLang;
+            doc->langUserSet = true;
+            Ne_ApplyLang(doc->hSci, newLang);
+            Ne_UpdateLangMenuCheck(newLang);
+            Ne_UpdateStatusText(hwnd);
+            Ne_SyncToolbar(hwnd, doc->hSci);
             return 0;
         }
         // ── Convert menu ──────────────────────────────────────────────────────
@@ -5754,6 +7838,57 @@ static LRESULT CALLBACK Ne_WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
         // ── Help menu ─────────────────────────────────────────────────────────
         if (wmId == IDM_SHORTCUTS) { Ne_ShowShortcuts(hwnd);      return 0; }
         if (wmId == IDM_ABOUT)     { ShowNsbAboutDialog(hwnd);     return 0; }
+        // ── FTP menu ──────────────────────────────────────────────────────────
+        if (wmId == IDM_FTP_ADD_SITE) {
+            Ne_ShowFtpSiteDialog(hwnd, nullptr);
+            return 0;
+        }
+        if (wmId == IDM_FTP_DISCONNECT) {
+            // Disconnect the active tab's profile, or the current active conn.
+            NeTabDoc* aDoc = NeTabs_GetActiveDoc(hwnd);
+            int64_t discId = (aDoc && aDoc->isFtpFile) ? aDoc->ftpProfileId : 0;
+            if (discId)
+                NeFtp_Disconnect(discId);
+            else
+                NeFtp_Disconnect();
+            Ne_UpdateFtpStatus(hwnd);
+            return 0;
+        }
+        if (wmId >= IDM_FTP_CONNECT_BASE && wmId < IDM_FTP_CONNECT_BASE + 100) {
+            std::vector<NeProfile> ftpProfiles;
+            NeProfiles_List(ftpProfiles);
+            int ftpIdx = wmId - IDM_FTP_CONNECT_BASE;
+            if (ftpIdx >= 0 && ftpIdx < (int)ftpProfiles.size()) {
+                NeProfile toConnect = ftpProfiles[ftpIdx];
+                // Already connected — just open the browser for this profile.
+                if (NeFtp_IsConnected(toConnect.id)) {
+                    NeFtp_SetActiveConn(toConnect.id);
+                    Ne_UpdateFtpStatus(hwnd);
+                    Ne_ShowFtpBrowser(hwnd, toConnect.id);
+                    return 0;
+                }
+                // Prompt for password if not saved
+                if (!toConnect.rememberPassword || toConnect.password.empty()) {
+                    std::wstring pw;
+                    if (!Ne_ShowPasswordPrompt(hwnd, toConnect.friendlyName, pw))
+                        return 0;
+                    toConnect.password = pw;
+                }
+                SetCursor(LoadCursorW(NULL, IDC_WAIT));
+                bool connected = NeFtp_Connect(toConnect);
+                SetCursor(LoadCursorW(NULL, IDC_ARROW));
+                if (connected) {
+                    Ne_UpdateFtpStatus(hwnd);
+                    Ne_ShowFtpBrowser(hwnd, toConnect.id);
+                } else {
+                    NeDialogButtonSpec okBtn = { IDOK, Ls(L"BTN_OK"), NeBtnTone::Blue,
+                                                 IDI_ERROR, 0 };
+                    Ne_ShowChoiceDialog(hwnd, Ls(L"FTP_CONN_FAILED"),
+                                        NeFtp_GetLastError(), &okBtn, 1, IDOK);
+                }
+            }
+            return 0;
+        }
 
         if (!hEdit) break;
 
@@ -5871,16 +8006,23 @@ static LRESULT CALLBACK Ne_WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
         if (wmId == IDC_NE_CLEARFMT)   { Ne_ClearFormatting(hEdit); Ne_SyncToolbar(hwnd, hEdit); SetFocus(hEdit); return 0; }
         if (wmId == IDC_NE_PRINT_BTN)  { SendMessageW(hwnd, WM_COMMAND, IDM_PRINT, 0); return 0; }
         if (wmId == IDC_NE_WORDWRAP)   { Ne_ToggleWordWrap(hwnd, hEdit); SetFocus(hEdit); return 0; }
+        if (wmId == IDC_BTN_LINENUM) {
+            s_lineNumsOn = !s_lineNumsOn;
+            Ne_SyncLineNumBtn(hwnd);
+            HWND hAct = NeTabs_GetActiveEdit(hwnd);
+            if (hAct) SetFocus(hAct);
+            return 0;
+        }
         if (wmId == IDC_NE_CASE)       { Ne_ToggleCase(hEdit); SetFocus(hEdit); return 0; }
 
         // ── Zoom combobox ─────────────────────────────────────────────────────
         if (wmId == IDC_NE_ZOOM && wmEv == CBN_SELCHANGE) {
             HWND hZ = GetDlgItem(hwnd, IDC_NE_ZOOM);
             int sel = (int)SendMessageW(hZ, CB_GETCURSEL, 0, 0);
-            static const int zoomPcts[] = { 50, 75, 100, 125, 150, 200 };
-            if (sel >= 0 && sel < 6) {
-                int pct = zoomPcts[sel];
-                SendMessageW(hEdit, EM_SETZOOM, (WPARAM)pct, 100);
+            if (sel >= 0 && sel < s_zoomStepCount) {
+                g_zoomRtf = s_zoomSteps[sel];
+                SendMessageW(hEdit, EM_SETZOOM, (WPARAM)g_zoomRtf, 100);
+                NeProfiles_SetIntSetting("zoom_rtf", g_zoomRtf);
             }
             SetFocus(hEdit); return 0;
         }
@@ -5931,6 +8073,12 @@ static LRESULT CALLBACK Ne_WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
                 // Notify custom scrollbars that content dimensions may have changed
                 auto ih = s_sbH.find(hSrcEdit);
                 if (ih != s_sbH.end() && ih->second) msb_notify_content_changed(ih->second);
+                // Repaint line-number gutter — line count may have changed.
+                if (doc->hLineGutter) InvalidateRect(doc->hLineGutter, NULL, TRUE);
+            }
+            if (wmEv == EN_VSCROLL) {
+                // Repaint line-number gutter on vertical scroll.
+                if (doc && doc->hLineGutter) InvalidateRect(doc->hLineGutter, NULL, TRUE);
             }
             if (wmEv == EN_KILLFOCUS && doc) {
                 Ne_RememberDiskStamp(doc);
@@ -5980,6 +8128,7 @@ static LRESULT CALLBACK Ne_WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
                 HWND hEditA = NeTabs_GetActiveEdit(hwnd);
                 if (hEditA) Ne_SyncToolbar(hwnd, hEditA);
                 Ne_SyncScrollbarVisibility(hwnd);
+                Ne_SyncRichGutters(hwnd);
                 Ne_UpdateStatusText(hwnd);
                 Ne_UpdateTitle(hwnd);
                 NeTabDoc* docA = NeTabs_GetActiveDoc(hwnd);
@@ -6022,6 +8171,20 @@ static LRESULT CALLBACK Ne_WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
                     Ne_UpdateTitle(hwnd);
                     Ne_UpdateStatusText(hwnd);
                 }
+            } else if (scn->nmhdr.code == SCN_CHARADDED) {
+                HWND hSciActive = NeTabs_GetActiveScintilla(hwnd);
+                if (scn->nmhdr.hwndFrom == hSciActive) {
+                    NeTabDoc* docAC = NeTabs_GetActiveDoc(hwnd);
+                    if (docAC && docAC->hSci == hSciActive)
+                        Ne_SciAutoComplete(hSciActive, docAC->langId);
+                }
+            } else if (scn->nmhdr.code == SCN_ZOOM) {
+                // Ctrl+scroll on Scintilla: save new zoom level.
+                HWND hSciActive = NeTabs_GetActiveScintilla(hwnd);
+                if (scn->nmhdr.hwndFrom == hSciActive) {
+                    g_zoomSci = (int)SendMessageW(hSciActive, SCI_GETZOOM, 0, 0);
+                    NeProfiles_SetIntSetting("zoom_sci", g_zoomSci);
+                }
             }
         }
         break;
@@ -6035,7 +8198,31 @@ static LRESULT CALLBACK Ne_WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
 
     case NE_WM_TABNEW:
         Ne_New(hwnd);
+        Ne_SyncRichGutters(hwnd);
         return 0;
+
+    // ── WM_MENURBUTTONUP — right-click on menu item ────────────────────────────
+    case WM_MENURBUTTONUP: {
+        HMENU hM = (HMENU)lParam;
+        if (hM == s_hFtpMenu) {
+            int pos = (int)wParam;
+            MENUITEMINFOW mii = { sizeof(mii) };
+            mii.fMask = MIIM_ID;
+            if (GetMenuItemInfoW(hM, pos, TRUE, &mii)) {
+                int id = (int)mii.wID;
+                if (id >= IDM_FTP_CONNECT_BASE) {
+                    std::vector<NeProfile> ftpProfiles;
+                    NeProfiles_List(ftpProfiles);
+                    int idx = id - IDM_FTP_CONNECT_BASE;
+                    if (idx >= 0 && idx < (int)ftpProfiles.size()) {
+                        EndMenu();
+                        Ne_ShowFtpSiteDialog(hwnd, &ftpProfiles[idx]);
+                    }
+                }
+            }
+        }
+        return 0;
+    }
 
     // ── WM_CONTEXTMENU — right-click context menus ─────────────────────────────
     case WM_CONTEXTMENU: {
@@ -6129,8 +8316,8 @@ static LRESULT CALLBACK Ne_WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
         if (!d || d->isSeparator) { mis->itemHeight = S(8); mis->itemWidth = 10; return TRUE; }
         HDC hdc = GetDC(hwnd);
         HFONT hOld = (HFONT)SelectObject(hdc, g_hMenuFont);
-        const wchar_t* tab = d->text ? wcschr(d->text, L'\t') : nullptr;
-        std::wstring main = (d->text && tab) ? std::wstring(d->text, tab - d->text) : (d->text ? d->text : L"");
+        const wchar_t* tab = wcschr(d->text.c_str(), L'\t');
+        std::wstring main = tab ? std::wstring(d->text.c_str(), tab - d->text.c_str()) : d->text;
         RECT rc = {}; DrawTextW(hdc, main.c_str(), -1, &rc, DT_CALCRECT | DT_SINGLELINE);
         int accelW = 0;
         if (tab && !d->isBar) {
@@ -6212,13 +8399,23 @@ static LRESULT CALLBACK Ne_WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
                 SetBkMode(dis->hDC, TRANSPARENT);
 
                 HFONT hf = (HFONT)SendMessageW(dis->hwndItem, WM_GETFONT, 0, 0);
-                if (!hf) hf = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+                bool  createdFont = false;
+                if (!hf) {
+                    // Use Segoe UI so all Unicode glyphs (◂ ▸ ↵ etc.) render correctly.
+                    int ht = -(MulDiv(10, GetDeviceCaps(dis->hDC, LOGPIXELSY), 72));
+                    hf = CreateFontW(ht, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                                     DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                                     CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
+                    createdFont = (hf != NULL);
+                    if (!hf) hf = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+                }
                 HFONT hOld = (HFONT)SelectObject(dis->hDC, hf);
 
                 RECT rcTxt = { rc.left + (pressed?1:0), rc.top + (pressed?1:0),
                                rc.right, rc.bottom };
                 DrawTextW(dis->hDC, txt, -1, &rcTxt, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
                 SelectObject(dis->hDC, hOld);
+                if (createdFont) DeleteObject(hf);
             }
             return TRUE;
         }
@@ -6248,9 +8445,16 @@ static LRESULT CALLBACK Ne_WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
                                  RGB(30, 30, 30);
         SetTextColor(dis->hDC, fg);
         SetBkMode(dis->hDC, TRANSPARENT);
+        // Draw gutter icon if present
+        if (!d->isBar && d->hSmallIcon) {
+            int iconSize = S(16);
+            int ix = rc.left + (S(28) - iconSize) / 2;
+            int iy = (rc.top + rc.bottom - iconSize) / 2;
+            DrawIconEx(dis->hDC, ix, iy, d->hSmallIcon, iconSize, iconSize, 0, NULL, DI_NORMAL);
+        }
         HFONT hOld = (HFONT)SelectObject(dis->hDC, g_hMenuFont);
-        const wchar_t* tab = d->text ? wcschr(d->text, L'\t') : nullptr;
-        std::wstring mainTxt = (d->text && tab) ? std::wstring(d->text, tab - d->text) : (d->text ? d->text : L"");
+        const wchar_t* tab = wcschr(d->text.c_str(), L'\t');
+        std::wstring mainTxt = tab ? std::wstring(d->text.c_str(), tab - d->text.c_str()) : d->text;
         int leftPad = d->isBar ? S(10) : S(28);
         RECT rcT = { rc.left + leftPad, rc.top, rc.right - S(6), rc.bottom };
         DrawTextW(dis->hDC, mainTxt.c_str(), -1, &rcT, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
@@ -6265,6 +8469,13 @@ static LRESULT CALLBACK Ne_WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
     // ── WM_INITMENUPOPUP — grey menu items dynamically ───────────────────────
     case WM_INITMENUPOPUP: {
         HMENU hPop = (HMENU)wParam;
+
+        // ── FTP popup — rebuild from DB each time it opens ────────────────────
+        if (hPop == s_hFtpMenu) {
+            Ne_RebuildFtpMenu(hwnd);
+            return 0;
+        }
+
         HWND hEdit = NeTabs_GetActiveEdit(hwnd);
         if (!hEdit) break;
 
@@ -6390,6 +8601,7 @@ static LRESULT CALLBACK Ne_WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
         NeTabs_Destroy(hwnd);
 
         if (g_hMenuFont) { DeleteObject(g_hMenuFont); g_hMenuFont = NULL; }
+        if (g_hFtpMenuIcon) { DestroyIcon(g_hFtpMenuIcon); g_hFtpMenuIcon = NULL; }
         for (auto* p : g_menuItemStorage) delete p;
         g_menuItemStorage.clear();
 
@@ -6471,6 +8683,16 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR lpCmdLine, int nCmdShow)
         }
     }
 
+    NeFtp_Init();
+    NeCrypto_Init();
+    NeProfiles_Init();
+    // Load persistent zoom settings.
+    NeProfiles_GetIntSetting("zoom_rtf", 100, g_zoomRtf);
+    NeProfiles_GetIntSetting("zoom_sci",   0, g_zoomSci);
+    // Clamp to valid ranges.
+    if (g_zoomRtf < 10) g_zoomRtf = 10; if (g_zoomRtf > 500) g_zoomRtf = 500;
+    if (g_zoomSci < -10) g_zoomSci = -10; if (g_zoomSci > 20) g_zoomSci = 20;
+
     ShowWindow(s_hwndMain, nCmdShow);
     UpdateWindow(s_hwndMain);
 
@@ -6481,7 +8703,10 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR lpCmdLine, int nCmdShow)
             continue;
 
         // Intercept Ctrl+N/O/S/Shift+S before the RichEdit consumes them.
-        if (msg.message == WM_KEYDOWN && (GetKeyState(VK_CONTROL) & 0x8000)) {
+        // Skip when Right-Alt (AltGr) is held — AltGr = Ctrl+Alt on Windows,
+        // so keys like AltGr+0 (}) would otherwise be swallowed by the zoom handler.
+        if (msg.message == WM_KEYDOWN && (GetKeyState(VK_CONTROL) & 0x8000)
+                && !(GetKeyState(VK_RMENU) & 0x8000)) {
             bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
             if (msg.wParam == 'N') { SendMessageW(s_hwndMain, WM_COMMAND, IDM_NEW, 0);    continue; }
             if (msg.wParam == 'O') { SendMessageW(s_hwndMain, WM_COMMAND, IDM_OPEN, 0);   continue; }
@@ -6518,6 +8743,25 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR lpCmdLine, int nCmdShow)
                 if (msg.wParam == 'U') { SendMessageW(s_hwndMain, WM_COMMAND, IDC_NE_UNDERLINE, 0); continue; }
                 if (msg.wParam == 'F') { SendMessageW(s_hwndMain, WM_COMMAND, IDC_NE_FIND,      0); continue; }
             }
+            // Ctrl++ / Ctrl+- / Ctrl+0 — zoom in/out/reset (numpad and regular keys).
+            if (msg.wParam == VK_ADD || msg.wParam == VK_OEM_PLUS) {
+                Ne_StepZoom(s_hwndMain, +1); continue;
+            }
+            if (msg.wParam == VK_SUBTRACT || msg.wParam == VK_OEM_MINUS) {
+                Ne_StepZoom(s_hwndMain, -1); continue;
+            }
+            if (msg.wParam == '0' || msg.wParam == VK_NUMPAD0) {
+                Ne_StepZoom(s_hwndMain, 0); continue;
+            }
+        }
+        // Ctrl+WheelScroll on an RTF tab: intercept, apply stepped zoom, save.
+        if (msg.message == WM_MOUSEWHEEL && (GET_KEYSTATE_WPARAM(msg.wParam) & MK_CONTROL)) {
+            NeTabDoc* wdoc = NeTabs_GetActiveDoc(s_hwndMain);
+            if (wdoc && !wdoc->hSci && wdoc->hEdit) {
+                int delta = GET_WHEEL_DELTA_WPARAM(msg.wParam);
+                Ne_StepZoom(s_hwndMain, delta > 0 ? +1 : -1);
+                continue; // don't pass to RichEdit's native zoom handler
+            }
         }
         // F1 → Keyboard Shortcuts dialog
         if (msg.message == WM_KEYDOWN && msg.wParam == VK_F1) {
@@ -6527,5 +8771,8 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR lpCmdLine, int nCmdShow)
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
+    NeProfiles_Close();
+    NeCrypto_Close();
+    NeFtp_Cleanup();
     return (int)msg.wParam;
 }

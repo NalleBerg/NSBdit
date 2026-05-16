@@ -1,6 +1,29 @@
 <h2 style="text-align: center; background-color: #e8f4f8; padding: 15px; border-radius: 5px; margin-bottom: 20px;"><span style="color: #0066cc;">&#x1F4DD; NSBEdit &mdash; Standalone RTF Notepad</span></h2>
 <h3 style="text-align: center;">&nbsp;</h3>
-<p style="text-align: center; font-size: 14px; color: #666; margin-bottom: 30px;"><strong>Latest Update:</strong> 15 May 2026 &mdash; v2026.05.15.12 (12:15)<br />Lightweight portable RTF editor for Windows. Drop the exe anywhere and run.</p>
+<p style="text-align: center; font-size: 14px; color: #666; margin-bottom: 30px;"><strong>Latest Update:</strong> 16 May 2026 &mdash; v2026.05.16.09 (09:58)<br />Lightweight portable RTF editor for Windows. Drop the exe anywhere and run.</p>
+
+<h3 style="text-align: center;"><span style="color: #ff0000;">NSBEdit Version 2026.05.16.09</span></h3>
+<p><strong>RichEdit line-number gutter, autocomplete fix (16.05.2026, 09:58):</strong></p>
+<ul>
+<li><strong>RichEdit line-number gutter (<code>NsbLineGutter</code>):</strong> A custom child window class is now registered and painted alongside each RichEdit tab. It is always visible &mdash; as a thin strip (toggle button only) when line numbers are off, and at full width when on. Clicking the strip toggles numbers on all open tabs simultaneously.</li>
+<li><strong><code>Ne_EnsureLineGutter()</code>:</strong> Creates the <code>NsbLineGutter</code> window for a RichEdit doc if it does not already exist, and attaches a tooltip that shows &ldquo;Show line numbers&rdquo; or &ldquo;Hide line numbers&rdquo; depending on current state.</li>
+<li><strong><code>Ne_SyncRichGutters()</code>:</strong> Repositions all gutters and shrinks the editor rect to make room after <code>NeTabs_SetRects</code>. Scintilla tabs receive only the thin strip (Scintilla draws its own built-in margin); RichEdit tabs receive full width (S(44)) when on, thin strip (S(20)) when off.</li>
+<li><strong><code>Ne_SyncLineNumBtn()</code> rewritten:</strong> Iterates all open tabs &mdash; sends <code>SCI_SETMARGINWIDTHN</code> to Scintilla windows and invalidates / updates the tooltip text on RichEdit gutters. Calls <code>Ne_SyncRichGutters</code> at the end to keep layout consistent.</li>
+<li><strong><code>s_lineNumsOn</code> global flag:</strong> Persists across tab switches. <code>Ne_SetupScintillaStyle</code> reads it to set the initial Scintilla margin width when a new Scintilla window is created.</li>
+<li><strong><code>NeTabDoc::hLineGutter</code> field:</strong> Added to <code>NeTabDoc</code> to store the companion gutter HWND per tab.</li>
+<li><strong>Autocomplete case-insensitive:</strong> <code>SCI_AUTOCSETIGNORECASE TRUE</code> added to <code>Ne_SetupScintillaStyle</code>.</li>
+</ul>
+
+<h3 style="text-align: center;"><span style="color: #ff0000;">NSBEdit Version 2026.05.15.16</span></h3>
+<p><strong>Syntax highlighting, AltGr fix, FTP Save to FTP (15.05.2026, 16:56):</strong></p>
+<ul>
+<li><strong>Syntax highlighting working for all languages:</strong> New <code>Ne_ApplyLang(hSci, langIdx)</code> wrapper sends the keyword list via <code>SCI_SETKEYWORDS</code> so the lexer can colour keywords, and applies per-lexer style overrides where Scintilla&rsquo;s generic style indices do not apply. Previously no keywords were ever sent to the lexer, so all text remained black.</li>
+<li><strong>PHP switched to <code>phpscript</code> lexer:</strong> PHP was mapped to the <code>hypertext</code> (HTML-embedded) lexer whose PHP token style IDs start at 118 &mdash; outside the generic 1&ndash;10 range. Switched to <code>phpscript</code> with correct <code>SCE_HPHP_*</code> style IDs (118&ndash;127): strings red, keywords blue/bold, <code>$variables</code> purple, comments green italic, numbers green.</li>
+<li><strong>Language menu converts RichEdit tab to Scintilla:</strong> Choosing a language on an untitled (RichEdit) tab now extracts the plain text, creates a Scintilla window at the same position, loads the text in, hides the RichEdit, and applies the chosen lexer and styles &mdash; no reopen needed.</li>
+<li><strong>AltGr key fix (Norwegian / international keyboards):</strong> Windows reports AltGr as Ctrl+Alt. The main message loop&rsquo;s Ctrl-shortcut block was intercepting AltGr+0 (&lsquo;}&rsquo;) and similar before they reached the editor. Fixed by skipping the shortcut block when Right Alt (<code>VK_RMENU</code>) is held.</li>
+<li><strong>File &rarr; Save to FTP&hellip;:</strong> Uploads the active document to any connected FTP server. The FTP browser opens in save mode &mdash; a filename edit box above the tree, and &ldquo;Save here&rdquo; (green) / &ldquo;Cancel&rdquo; (red) buttons at the bottom. After upload the tab is marked FTP-linked, a green success dialog confirms, and the connection stays open. Temp file written to <code>%TEMP%\NSBEdit_savelocal\</code> for the upload.</li>
+<li><strong>Locale additions:</strong> <code>MENU_SAVE_TO_FTP</code>, <code>FTP_SAVE_BROWSER</code>, <code>FTP_FILENAME_PROMPT</code>, <code>FTP_SAVE_HERE</code>, <code>FTP_SAVE_TO</code>, <code>FTP_SAVED_OK</code> added to <code>locale/en_GB.txt</code>.</li>
+</ul>
 
 <h3 style="text-align: center;"><span style="color: #ff0000;">NSBEdit Version 2026.05.15.12</span></h3>
 <p><strong>Credits dialog, owner-draw About/License/Credits buttons (15.05.2026, 12:15):</strong></p>
