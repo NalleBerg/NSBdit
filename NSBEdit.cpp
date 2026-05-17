@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <sstream>
 #include <map>
+#include <set>
 #include <unordered_map>
 #include <unordered_set>
 #include <regex>
@@ -1593,6 +1594,9 @@ static void Ne_UpdateStatusText(HWND hwnd)
 
     // Centre info: encoding / language
     NeEncoding enc = doc ? (NeEncoding)doc->encoding : NeEncoding::Unknown;
+    // Untitled RichEdit tabs have encoding==Unknown until first save; show "RTF" anyway
+    if (enc == NeEncoding::Unknown && Ne_DocIsRtf(doc))
+        enc = NeEncoding::RichText;
     if (doc && doc->hSci && doc->langId >= 0 && doc->langId < NE_LANG_COUNT)
         NeStatusBar_SetInfo(hSb, s_langs[doc->langId].name);
     else
@@ -3786,13 +3790,16 @@ static void Ne_ShowTableDialog(HWND parent, HWND hEdit)
 #define IDC_HRP_ALIGN_L      287
 #define IDC_HRP_ALIGN_C      288
 #define IDC_HRP_ALIGN_R      289
+#define IDC_HRP_COLOR_END    290   // "Choose End Color…" button
+#define IDC_HRP_SWATCH_END   291   // gradient end colour preview
 
 struct NeHRuleProps {
     int      styleIdx;    // 0=single thin .. 5=hairline
     int      thickness;   // half-points (stored in wBorderWidth)
     int      spaceBefore; // twips
     int      spaceAfter;  // twips
-    COLORREF color;       // 24-bit RGB
+    COLORREF color;       // 24-bit RGB start colour
+    COLORREF colorEnd;    // gradient end colour (== color means solid line)
     int      widthPct;    // 10-100 (% of paragraph width)
     int      align;       // 0=left, 1=center, 2=right
 };
@@ -3803,7 +3810,8 @@ static const wchar_t* s_hrStyleName[6] = {
 
 static NeDialogData s_hrPropsDD;
 static NeHRuleProps s_hrPropsResult;
-static HBRUSH       s_hrSwatchBrush  = NULL;
+static HBRUSH       s_hrSwatchBrush    = NULL;
+static HBRUSH       s_hrSwatchBrushEnd = NULL;
 static COLORREF     s_hrCustomColors[16] = {};
 
 static LRESULT CALLBACK Ne_HRulePropsDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
@@ -3812,16 +3820,17 @@ static LRESULT CALLBACK Ne_HRulePropsDlgProc(HWND hwnd, UINT msg, WPARAM wParam,
     case WM_COMMAND:
         if (HIWORD(wParam) == BN_CLICKED) {
             int cmd = LOWORD(wParam);
-            if (cmd == IDC_HRP_COLOR) {
+            if (cmd == IDC_HRP_COLOR || cmd == IDC_HRP_COLOR_END) {
+                int swatchId = (cmd == IDC_HRP_COLOR) ? IDC_HRP_SWATCH : IDC_HRP_SWATCH_END;
                 CHOOSECOLORW cc = {};
                 cc.lStructSize  = sizeof(cc);
                 cc.hwndOwner    = hwnd;
                 cc.lpCustColors = s_hrCustomColors;
                 cc.rgbResult    = (COLORREF)(DWORD_PTR)GetWindowLongPtrW(
-                                      GetDlgItem(hwnd, IDC_HRP_SWATCH), GWLP_USERDATA);
+                                      GetDlgItem(hwnd, swatchId), GWLP_USERDATA);
                 cc.Flags        = CC_FULLOPEN | CC_RGBINIT;
                 if (ChooseColorW(&cc)) {
-                    HWND hSwatch = GetDlgItem(hwnd, IDC_HRP_SWATCH);
+                    HWND hSwatch = GetDlgItem(hwnd, swatchId);
                     SetWindowLongPtrW(hSwatch, GWLP_USERDATA, (LONG_PTR)(DWORD_PTR)cc.rgbResult);
                     InvalidateRect(hSwatch, NULL, TRUE);
                 }
@@ -3841,6 +3850,8 @@ static LRESULT CALLBACK Ne_HRulePropsDlgProc(HWND hwnd, UINT msg, WPARAM wParam,
                 s_hrPropsResult.spaceAfter  = std::max(0, rd(IDC_HRP_SPACE_BELOW)) * 20;
                 s_hrPropsResult.color       = (COLORREF)(DWORD_PTR)GetWindowLongPtrW(
                                                   GetDlgItem(hwnd, IDC_HRP_SWATCH), GWLP_USERDATA);
+                s_hrPropsResult.colorEnd    = (COLORREF)(DWORD_PTR)GetWindowLongPtrW(
+                                                  GetDlgItem(hwnd, IDC_HRP_SWATCH_END), GWLP_USERDATA);
                 s_hrPropsResult.widthPct    = std::max(10, std::min(100, rd(IDC_HRP_WIDTH)));
                 s_hrPropsResult.align       =
                     (SendMessageW(GetDlgItem(hwnd, IDC_HRP_ALIGN_L), BM_GETCHECK, 0, 0) == BST_CHECKED) ? 0 :
@@ -3865,12 +3876,14 @@ static LRESULT CALLBACK Ne_HRulePropsDlgProc(HWND hwnd, UINT msg, WPARAM wParam,
         break;
     case WM_CTLCOLORSTATIC: {
         HWND hCtrl = (HWND)lParam;
-        if (GetDlgCtrlID(hCtrl) == IDC_HRP_SWATCH) {
+        int ctrlId = GetDlgCtrlID(hCtrl);
+        if (ctrlId == IDC_HRP_SWATCH || ctrlId == IDC_HRP_SWATCH_END) {
             COLORREF col = (COLORREF)(DWORD_PTR)GetWindowLongPtrW(hCtrl, GWLP_USERDATA);
-            if (s_hrSwatchBrush) { DeleteObject(s_hrSwatchBrush); s_hrSwatchBrush = NULL; }
-            s_hrSwatchBrush = CreateSolidBrush(col);
+            HBRUSH& brush = (ctrlId == IDC_HRP_SWATCH) ? s_hrSwatchBrush : s_hrSwatchBrushEnd;
+            if (brush) { DeleteObject(brush); brush = NULL; }
+            brush = CreateSolidBrush(col);
             SetBkColor((HDC)wParam, col);
-            return (LRESULT)s_hrSwatchBrush;
+            return (LRESULT)brush;
         }
         SetBkColor((HDC)wParam, GetSysColor(COLOR_WINDOW));
         SetTextColor((HDC)wParam, RGB(20, 20, 20));
@@ -3902,7 +3915,7 @@ static void Ne_ApplyHRuleProps(HWND hEdit, const NeHRuleProps& p)
     pf.dwMask        = PFM_BORDER | PFM_STYLE | PFM_SPACEBEFORE | PFM_SPACEAFTER
                      | PFM_STARTINDENT | PFM_RIGHTINDENT | PFM_ALIGNMENT;
     pf.sStyle        = 42;   // HR marker — more reliably stored than wBorders
-    pf.wBorders      = (WORD)(0x08 | ((p.styleIdx + 1) << 8));
+    pf.wBorders      = (WORD)((p.styleIdx + 1) << 8);  // side bits = 0 → no native border drawn by RichEdit
     pf.wBorderWidth  = (WORD)(p.thickness * 20);  // points → twips
     pf.wBorderSpace  = 20;
     pf.dySpaceBefore = (SHORT)p.spaceBefore;
@@ -3949,6 +3962,7 @@ static NeHRuleProps Ne_ReadHRuleProps(HWND hEdit)
     if      (pf.wAlignment == PFA_RIGHT)  p.align = 2;
     else if (pf.wAlignment == PFA_CENTER) p.align = 1;
     else                                  p.align = 0;
+    p.colorEnd = p.color;  // default: solid; Ne_EditHRuleProps overrides from stored entry
     return p;
 }
 
@@ -3976,7 +3990,8 @@ static bool Ne_ShowHRulePropsDialog(HWND parent, HWND hEdit, bool insertMode, Ne
     clientH += rowH;                     // space below
     clientH += rowH;                     // width
     clientH += rowH;                     // alignment
-    clientH += LH + S(4) + EB + S(12);  // color
+    clientH += rowH;                     // start colour
+    clientH += LH + S(4) + EB + S(12);  // end colour (gradient)
     clientH += CB + P;                   // buttons
     int clientW = std::max(S(390), VX + 3 * S(70) + S(20));
 
@@ -4071,18 +4086,30 @@ static bool Ne_ShowHRulePropsDialog(HWND parent, HWND hEdit, bool insertMode, Ne
     }
     y0 += EB + S(8);
 
-    // Color
-    mkLbl(L"Color:", y0); y0 += LH + S(4);
+    // Start colour
+    mkLbl(L"Start colour:", y0); y0 += LH + S(4);
     // Swatch — painted via WM_CTLCOLORSTATIC
     HWND hSwatch = CreateWindowExW(WS_EX_STATICEDGE, L"STATIC", L"",
         WS_CHILD | WS_VISIBLE,
         VX, y0, S(36), EB, dlg, (HMENU)(UINT_PTR)IDC_HRP_SWATCH, hi, NULL);
     SetWindowLongPtrW(hSwatch, GWLP_USERDATA, (LONG_PTR)(DWORD_PTR)inout->color);
-    // "Choose…" button opens ChooseColorW
     HWND hChooseBtn = CreateWindowExW(0, L"BUTTON", L"Choose\u2026",
         WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
         VX + S(44), y0, S(90), EB, dlg, (HMENU)(UINT_PTR)IDC_HRP_COLOR, hi, NULL);
     if (hf) SendMessageW(hChooseBtn, WM_SETFONT, (WPARAM)hf, TRUE);
+    y0 += EB + S(8);
+
+    // End colour (set same as start = solid line; set different = left-to-right gradient)
+    mkLbl(L"End colour (gradient):", y0); y0 += LH + S(4);
+    HWND hSwatchEnd = CreateWindowExW(WS_EX_STATICEDGE, L"STATIC", L"",
+        WS_CHILD | WS_VISIBLE,
+        VX, y0, S(36), EB, dlg, (HMENU)(UINT_PTR)IDC_HRP_SWATCH_END, hi, NULL);
+    SetWindowLongPtrW(hSwatchEnd, GWLP_USERDATA, (LONG_PTR)(DWORD_PTR)inout->colorEnd);
+    HWND hChooseBtnEnd = CreateWindowExW(0, L"BUTTON", L"Choose\u2026",
+        WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+        VX + S(44), y0, S(90), EB, dlg, (HMENU)(UINT_PTR)IDC_HRP_COLOR_END, hi, NULL);
+    if (hf) SendMessageW(hChooseBtnEnd, WM_SETFONT, (WPARAM)hf, TRUE);
+    (void)hSwatchEnd; (void)hChooseBtnEnd;
     y0 += EB + S(12);
 
     // Apply / Cancel buttons
@@ -4121,16 +4148,35 @@ static bool Ne_ShowHRulePropsDialog(HWND parent, HWND hEdit, bool insertMode, Ne
         if (!IsDialogMessageW(dlg, &m)) { TranslateMessage(&m); DispatchMessageW(&m); }
     }
     bool ok = (s_hrPropsDD.result == IDOK);
-    if (s_hrSwatchBrush) { DeleteObject(s_hrSwatchBrush); s_hrSwatchBrush = NULL; }
+    if (s_hrSwatchBrush)    { DeleteObject(s_hrSwatchBrush);    s_hrSwatchBrush    = NULL; }
+    if (s_hrSwatchBrushEnd) { DeleteObject(s_hrSwatchBrushEnd); s_hrSwatchBrushEnd = NULL; }
     if (parent) { EnableWindow(parent, TRUE); SetForegroundWindow(parent); }
     if (ok) *inout = s_hrPropsResult;
     return ok;
 }
 
+// ── HR entry cache (declared here so Ne_InsertHRule / Ne_EditHRuleProps can access it) ──────────
+struct NeHRuleEntry {
+    LONG     charIdx;
+    COLORREF color;
+    COLORREF colorEnd;         // == color → solid line; different → left-to-right gradient
+    int      thicknessTwips;   // pt * 20
+    int      leftIndentTwips;
+    int      rightIndentTwips;
+    int      styleIdx;         // 0=single, 1=thick, 2=double, 3=dotted, 4=dashed, 5=hairline
+};
+static std::map<HWND, std::vector<NeHRuleEntry>> g_hrMap;
+// Legitimate HR charIdx sets saved by the WM_CHAR '\r' handler BEFORE calling
+// through to RichEdit.  Consumed (and erased) by NE_WM_HR_CLEANUP.  Needed
+// because EN_CHANGE (fired during CallWindowProc) rebuilds g_hrMap and may
+// include the freshly-inherited paragraph as a second HR entry; using this
+// separate snapshot lets the cleanup correctly distinguish real vs spurious.
+static std::map<HWND, std::set<LONG>> g_hrPendingCleanup;
+
 // ── Ne_InsertHRule / Ne_EditHRuleProps (forward-declared near Ne_CaretOnHRule) ─
 static void Ne_InsertHRule(HWND hwnd, HWND hEdit)
 {
-    NeHRuleProps p = { 0, 1, 60, 60, RGB(128,128,128), 100, 1 };  // defaults: single, 1pt, spacing, gray, full width, center
+    NeHRuleProps p = { 0, 1, 60, 60, RGB(128,128,128), RGB(128,128,128), 100, 1 };  // defaults: single, 1pt, spacing, gray solid, full width, center
     if (!Ne_ShowHRulePropsDialog(hwnd, hEdit, true, &p)) return;
 
     // Collapse to end of current line
@@ -4160,15 +4206,39 @@ static void Ne_InsertHRule(HWND hwnd, HWND hEdit)
     pfClean.wAlignment    = PFA_LEFT;
     SendMessageW(hEdit, EM_SETPARAFORMAT, 0, (LPARAM)&pfClean);
     Ne_RebuildHRList(hEdit);
+    // Set gradient colorEnd on the newly inserted HR (one line above the follow-up paragraph)
+    if (p.colorEnd != p.color) {
+        CHARRANGE crNow = {};
+        SendMessageW(hEdit, EM_EXGETSEL, 0, (LPARAM)&crNow);
+        int cleanLine = (int)SendMessageW(hEdit, EM_LINEFROMCHAR, crNow.cpMin, 0);
+        LONG hrIdx    = (LONG)SendMessageW(hEdit, EM_LINEINDEX, std::max(0, cleanLine - 1), 0);
+        for (auto& e : g_hrMap[hEdit]) {
+            if (e.charIdx == hrIdx) { e.colorEnd = p.colorEnd; break; }
+        }
+    }
     InvalidateRect(hEdit, NULL, FALSE);
 }
 
 static void Ne_EditHRuleProps(HWND hwnd, HWND hEdit)
 {
-    NeHRuleProps p = Ne_ReadHRuleProps(hEdit);
+    // Capture the HR's char index before any changes
+    CHARRANGE crCur = {};
+    SendMessageW(hEdit, EM_EXGETSEL, 0, (LPARAM)&crCur);
+    int hrLine     = (int)SendMessageW(hEdit, EM_LINEFROMCHAR, crCur.cpMin, 0);
+    LONG hrCharIdx = (LONG)SendMessageW(hEdit, EM_LINEINDEX, hrLine, 0);
+
+    NeHRuleProps p = Ne_ReadHRuleProps(hEdit);  // sets p.colorEnd = p.color as default
+    // Override with stored gradient if already set
+    for (auto& e : g_hrMap[hEdit]) {
+        if (e.charIdx == hrCharIdx) { p.colorEnd = e.colorEnd; break; }
+    }
     if (!Ne_ShowHRulePropsDialog(hwnd, hEdit, false, &p)) return;
     Ne_ApplyHRuleProps(hEdit, p);
     Ne_RebuildHRList(hEdit);
+    // Update colorEnd in the rebuilt entry
+    for (auto& e : g_hrMap[hEdit]) {
+        if (e.charIdx == hrCharIdx) { e.colorEnd = p.colorEnd; break; }
+    }
     InvalidateRect(hEdit, NULL, FALSE);
 }
 
@@ -4602,19 +4672,15 @@ static bool Ne_HasFormatting(HWND hEdit)
 // Paragraph scanning with EM_EXSETSEL must NOT happen inside WM_PAINT (triggers
 // re-entrant WM_PAINT via RichEdit internal redraws).  We scan once on EN_CHANGE
 // and cache results; WM_PAINT only calls EM_POSFROMCHAR (safe, no sel change).
-struct NeHRuleEntry {
-    LONG     charIdx;
-    COLORREF color;
-    int      thicknessTwips;   // pt * 20
-    int      leftIndentTwips;
-    int      rightIndentTwips;
-};
-static std::map<HWND, std::vector<NeHRuleEntry>> g_hrMap;
+// NeHRuleEntry and g_hrMap are declared above Ne_InsertHRule.
 
 // Rebuild HR list for hEdit.  Safe to call at any time except during WM_PAINT.
 static void Ne_RebuildHRList(HWND hEdit)
 {
     auto& list = g_hrMap[hEdit];
+    // Preserve gradient end colours across rebuilds (survive formatting changes, not text shifts)
+    std::map<LONG, COLORREF> savedColorEnd;
+    for (auto& e : list) { if (e.colorEnd != e.color) savedColorEnd[e.charIdx] = e.colorEnd; }
     list.clear();
 
     int lineCount = (int)SendMessageW(hEdit, EM_GETLINECOUNT, 0, 0);
@@ -4645,9 +4711,11 @@ static void Ne_RebuildHRList(HWND hEdit)
         NeHRuleEntry e;
         e.charIdx          = idx;
         e.color            = (cf.dwEffects & CFE_AUTOCOLOR) ? RGB(128,128,128) : cf.crTextColor;
+        e.colorEnd         = savedColorEnd.count(idx) ? savedColorEnd.at(idx) : e.color;
         e.thicknessTwips   = (int)pf.wBorderWidth;
         e.leftIndentTwips  = (int)pf.dxStartIndent;
         e.rightIndentTwips = (int)pf.dxRightIndent;
+        e.styleIdx         = (pf.wBorders >= 0x100) ? std::max(0, std::min(5, (int)((pf.wBorders >> 8) - 1))) : 0;
         list.push_back(e);
     }
 
@@ -4688,14 +4756,60 @@ static void Ne_PaintHRules(HWND hwnd, HDC hdc)
         int drawY   = lineY + lineH / 2;
 
         int penPx = std::max(1, MulDiv(e.thicknessTwips, dpiY, 1440));
-        LOGBRUSH lb = { BS_SOLID, e.color, 0 };
-        HPEN hPen = ExtCreatePen(PS_GEOMETRIC | PS_SOLID | PS_ENDCAP_FLAT, penPx, &lb, 0, NULL);
-        if (!hPen) hPen = CreatePen(PS_SOLID, penPx, e.color);
-        HPEN hOld = (HPEN)SelectObject(hdc, hPen);
-        MoveToEx(hdc, leftPx,  drawY, NULL);
-        LineTo  (hdc, rightPx, drawY);
-        SelectObject(hdc, hOld);
-        DeleteObject(hPen);
+        if (e.styleIdx == 5) penPx = 1;  // hairline: always 1px
+
+        auto drawSolidLine = [&](int y) {
+            LOGBRUSH lb = { BS_SOLID, e.color, 0 };
+            HPEN hPen = ExtCreatePen(PS_GEOMETRIC | PS_SOLID | PS_ENDCAP_FLAT, penPx, &lb, 0, NULL);
+            if (!hPen) hPen = CreatePen(PS_SOLID, penPx, e.color);
+            HPEN hOld = (HPEN)SelectObject(hdc, hPen);
+            MoveToEx(hdc, leftPx,  y, NULL);
+            LineTo  (hdc, rightPx, y);
+            SelectObject(hdc, hOld);
+            DeleteObject(hPen);
+        };
+
+        if (e.colorEnd != e.color) {
+            // Gradient: fill a rect left-to-right using GradientFill (msimg32)
+            TRIVERTEX verts[2] = {};
+            verts[0].x = leftPx;   verts[0].y = drawY - penPx / 2;
+            verts[0].Red   = (COLOR16)(GetRValue(e.color)    << 8);
+            verts[0].Green = (COLOR16)(GetGValue(e.color)    << 8);
+            verts[0].Blue  = (COLOR16)(GetBValue(e.color)    << 8);
+            verts[0].Alpha = 0xFF00;
+            verts[1].x = rightPx;  verts[1].y = drawY + (penPx + 1) / 2 + 1;
+            verts[1].Red   = (COLOR16)(GetRValue(e.colorEnd) << 8);
+            verts[1].Green = (COLOR16)(GetGValue(e.colorEnd) << 8);
+            verts[1].Blue  = (COLOR16)(GetBValue(e.colorEnd) << 8);
+            verts[1].Alpha = 0xFF00;
+            GRADIENT_RECT gr = { 0, 1 };
+            GradientFill(hdc, verts, 2, &gr, 1, GRADIENT_FILL_RECT_H);
+        } else if (e.styleIdx == 2) {
+            // Double: two parallel lines separated by a gap equal to penPx
+            int gap  = std::max(1, penPx);
+            int half = penPx / 2 + gap / 2;
+            drawSolidLine(drawY - half);
+            drawSolidLine(drawY + half);
+        } else if (e.styleIdx == 3) {
+            // Dotted: cosmetic 1px dotted pen
+            HPEN hPen = CreatePen(PS_DOT, 1, e.color);
+            HPEN hOld = (HPEN)SelectObject(hdc, hPen);
+            MoveToEx(hdc, leftPx,  drawY, NULL);
+            LineTo  (hdc, rightPx, drawY);
+            SelectObject(hdc, hOld);
+            DeleteObject(hPen);
+        } else if (e.styleIdx == 4) {
+            // Dashed: cosmetic 1px dashed pen
+            HPEN hPen = CreatePen(PS_DASH, 1, e.color);
+            HPEN hOld = (HPEN)SelectObject(hdc, hPen);
+            MoveToEx(hdc, leftPx,  drawY, NULL);
+            LineTo  (hdc, rightPx, drawY);
+            SelectObject(hdc, hOld);
+            DeleteObject(hPen);
+        } else {
+            // Single thin / Thick / Hairline: solid line
+            drawSolidLine(drawY);
+        }
     }
 }
 
@@ -4741,6 +4855,12 @@ static std::wstring Ne_ExtractLinkUrlAt(HWND hEdit, LONG charIdx)
 
     return Ne_ParseHyperlinkFromRtf(rtf);
 }
+
+// Custom message posted by the WM_CHAR '\r' handler to clear inherited HR paragraph
+// format AFTER RichEdit has fully committed the paragraph split.  EM_SETPARAFORMAT
+// called mid-WM_CHAR gets overwritten by RichEdit's internal state machine; calling it
+// in a deferred message (next message-loop iteration) works correctly.
+static const UINT NE_WM_HR_CLEANUP = WM_APP + 1;
 
 // ── Thick-caret subclass for main editor RichEdit(s) ──────────────────────
 static LRESULT CALLBACK Ne_EditCaretProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
@@ -4814,6 +4934,140 @@ static LRESULT CALLBACK Ne_EditCaretProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
         g_hrMap.erase(hwnd);
         RemovePropW(hwnd, L"NeEditCaretPrev");
         SetWindowLongPtrW(hwnd, GWLP_WNDPROC, (LONG_PTR)prev);
+    }
+    // HR behaves like a single character: Delete and Backspace remove it from any adjacent position.
+    if ((msg == WM_KEYDOWN) && (wParam == VK_DELETE || wParam == VK_BACK)) {
+        CHARRANGE cr = {};
+        SendMessageW(hwnd, EM_EXGETSEL, 0, (LPARAM)&cr);
+        if (cr.cpMin == cr.cpMax) {  // no selection
+            int  ln        = (int)SendMessageW(hwnd, EM_LINEFROMCHAR, cr.cpMin, 0);
+            LONG lineStart = (LONG)SendMessageW(hwnd, EM_LINEINDEX, ln, 0);
+            LONG lineLen   = (LONG)SendMessageW(hwnd, EM_LINELENGTH, lineStart, 0);
+
+            // Which HR paragraph should we delete?
+            int  hrLn = -1;
+            bool moveToPrev = false;  // if true, place caret before the deleted para
+            if (wParam == VK_DELETE) {
+                if (Ne_CaretOnHRule(hwnd)) {
+                    hrLn = ln;                            // Delete on the HR itself
+                } else if (cr.cpMin == lineStart + lineLen) {
+                    // Caret at end of line — check if next line is an HR
+                    int nextLn = ln + 1;
+                    LONG nextStart = (LONG)SendMessageW(hwnd, EM_LINEINDEX, nextLn, 0);
+                    if (nextStart > lineStart) {
+                        auto it = g_hrMap.find(hwnd);
+                        if (it != g_hrMap.end())
+                            for (const auto& e : it->second)
+                                if (e.charIdx == nextStart) { hrLn = nextLn; break; }
+                    }
+                }
+            } else { // VK_BACK
+                if (Ne_CaretOnHRule(hwnd)) {
+                    hrLn = ln;
+                    moveToPrev = true;                    // Backspace on HR: land before it
+                } else if (cr.cpMin == lineStart && ln > 0) {
+                    // Caret at start of line — check if previous line is an HR
+                    int prevLn = ln - 1;
+                    LONG prevStart = (LONG)SendMessageW(hwnd, EM_LINEINDEX, prevLn, 0);
+                    auto it = g_hrMap.find(hwnd);
+                    if (it != g_hrMap.end())
+                        for (const auto& e : it->second)
+                            if (e.charIdx == prevStart) { hrLn = prevLn; moveToPrev = true; break; }
+                }
+            }
+
+            if (hrLn >= 0) {
+                LONG hrStart  = (LONG)SendMessageW(hwnd, EM_LINEINDEX, hrLn, 0);
+                LONG hrLen    = (LONG)SendMessageW(hwnd, EM_LINELENGTH, hrStart, 0);
+                LONG nextStart= (LONG)SendMessageW(hwnd, EM_LINEINDEX, hrLn + 1, 0);
+                CHARRANGE del;
+                if (nextStart > hrStart)
+                    del = { hrStart, nextStart };
+                else
+                    del = { std::max(0L, hrStart - 1), hrStart + hrLen };
+                LONG caretAfter = moveToPrev ? std::max(0L, hrStart - 1) : del.cpMin;
+                SendMessageW(hwnd, EM_EXSETSEL, 0, (LPARAM)&del);
+                SendMessageW(hwnd, EM_REPLACESEL, TRUE, (LPARAM)L"");
+                CHARRANGE crSet = { caretAfter, caretAfter };
+                SendMessageW(hwnd, EM_EXSETSEL, 0, (LPARAM)&crSet);
+                Ne_RebuildHRList(hwnd);
+                InvalidateRect(hwnd, NULL, FALSE);
+                return 0;
+            }
+        }
+    }
+    // ── Deferred HR-inheritance cleanup ──────────────────────────────────────
+    // Posted by the WM_CHAR '\r' handler below.  wParam = enterPos (the character index
+    // where Enter was pressed).  Fires after RichEdit has fully committed the paragraph
+    // split, so EM_SETPARAFORMAT reliably clears any inherited HR format.
+    if (msg == NE_WM_HR_CLEANUP) {
+        // Clear the re-entrancy flag set by the '\r' handler.
+        g_hrPendingCleanup.erase(hwnd);
+
+        LONG enterPos = (LONG)wParam;
+
+        DWORD oldMask = (DWORD)SendMessageW(hwnd, EM_GETEVENTMASK, 0, 0);
+        SendMessageW(hwnd, EM_SETEVENTMASK, 0, 0);
+        CHARRANGE crSave = {};
+        SendMessageW(hwnd, EM_EXGETSEL, 0, (LPARAM)&crSave);
+
+        // When Enter is pressed AT the start of an HR paragraph the first half of the
+        // split (at enterPos) inherits HR format.  Check exactly that position and strip
+        // it if it looks like an HR.  For Enter on any other line this paragraph is plain
+        // and the check is a cheap no-op.
+        CHARRANGE cr2 = { enterPos, enterPos };
+        SendMessageW(hwnd, EM_EXSETSEL, 0, (LPARAM)&cr2);
+        PARAFORMAT2 pf = {}; pf.cbSize = sizeof(pf);
+        pf.dwMask = PFM_BORDER | PFM_STYLE;
+        SendMessageW(hwnd, EM_GETPARAFORMAT, 0, (LPARAM)&pf);
+        if (pf.sStyle == 42 || pf.wBorders) {
+            PARAFORMAT2 pfClean = {}; pfClean.cbSize = sizeof(pfClean);
+            pfClean.dwMask = PFM_BORDER | PFM_STYLE | PFM_SPACEBEFORE | PFM_SPACEAFTER
+                           | PFM_STARTINDENT | PFM_RIGHTINDENT | PFM_ALIGNMENT;
+            pfClean.sStyle        = 0;
+            pfClean.wBorders      = 0;
+            pfClean.wBorderWidth  = 0;
+            pfClean.wBorderSpace  = 0;
+            pfClean.dySpaceBefore = 0;
+            pfClean.dySpaceAfter  = 0;
+            pfClean.dxStartIndent = 0;
+            pfClean.dxRightIndent = 0;
+            pfClean.wAlignment    = PFA_LEFT;
+            SendMessageW(hwnd, EM_SETPARAFORMAT, 0, (LPARAM)&pfClean);
+        }
+
+        SendMessageW(hwnd, EM_EXSETSEL, 0, (LPARAM)&crSave);
+        SendMessageW(hwnd, EM_SETEVENTMASK, 0, oldMask);
+        // EN_CHANGE was suppressed during the '\r' processing; this is the
+        // authoritative rebuild that brings g_hrMap to a correct post-Enter state.
+        Ne_RebuildHRList(hwnd);
+        InvalidateRect(hwnd, NULL, FALSE);
+        return 0;
+    }
+    // Prevent HR paragraph-format from bleeding into the new paragraph created by Enter.
+    // g_hrPendingCleanup[hwnd] is set as a re-entrancy flag so that EN_CHANGE (which fires
+    // synchronously inside CallWindowProc while RichEdit is mid-split) does not call
+    // Ne_RebuildHRList re-entrantly (unsafe: EM_EXSETSEL on a half-committed split can
+    // corrupt RichEdit's internal selection state).  The actual rebuild is deferred to
+    // NE_WM_HR_CLEANUP, which runs after the full WM_CHAR processing has settled.
+    if (msg == WM_CHAR && wParam == L'\r' && !(GetWindowLongW(hwnd, GWL_STYLE) & ES_READONLY)) {
+        if (g_hrMap[hwnd].empty()) return CallWindowProcW(prev, hwnd, msg, wParam, lParam);
+
+        // Capture caret position BEFORE Enter; this is the paragraph that will be split.
+        CHARRANGE crBefore = {};
+        SendMessageW(hwnd, EM_EXGETSEL, 0, (LPARAM)&crBefore);
+        LONG enterPos = crBefore.cpMin;
+
+        // Set re-entrancy flag (any non-empty set suffices).
+        g_hrPendingCleanup[hwnd].insert(enterPos);
+
+        LRESULT res = CallWindowProcW(prev, hwnd, msg, wParam, lParam);
+        // (EN_CHANGE fires during the line above; the flag causes it to skip its rebuild.)
+
+        // Deferred: NE_WM_HR_CLEANUP strips any inherited HR format and rebuilds g_hrMap.
+        // wParam carries enterPos so the handler knows which paragraph to inspect.
+        PostMessageW(hwnd, NE_WM_HR_CLEANUP, (WPARAM)enterPos, 0);
+        return res;
     }
     if (msg == WM_CHAR && !(GetWindowLongW(hwnd, GWL_STYLE) & ES_READONLY)) {
         wchar_t ch = (wchar_t)wParam;
@@ -8247,6 +8501,7 @@ static LRESULT CALLBACK Ne_WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
         if (hEdit) Ne_SyncToolbar(hwnd, hEdit);
         NeTabs_UpdateAllTitles(hwnd);
         Ne_UpdateToolbarMode(hwnd);
+        Ne_UpdateStatusText(hwnd);
         return 0;
     }
 
@@ -8814,6 +9069,19 @@ static LRESULT CALLBACK Ne_WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
                 if (ih != s_sbH.end() && ih->second) msb_notify_content_changed(ih->second);
                 // Repaint line-number gutter — line count may have changed.
                 if (doc->hLineGutter) InvalidateRect(doc->hLineGutter, NULL, TRUE);
+                // Keep HR charIdx values current.  Any text insertion or deletion before
+                // an HR shifts its absolute paragraph position; without a rebuild here the
+                // cached charIdx goes stale and Ne_PaintHRules draws at the wrong place
+                // (e.g. through typed text above the HR — the "strike-through" bug).
+                // IMPORTANT: do NOT rebuild synchronously while WM_CHAR '\r' is still on
+                // the call stack (g_hrPendingCleanup entry exists for this edit).  At that
+                // point RichEdit is mid-split and EM_EXSETSEL / EM_GETPARAFORMAT return
+                // inconsistent data, corrupting g_hrMap.  NE_WM_HR_CLEANUP (deferred)
+                // owns the rebuild for the Enter case.
+                if (g_hrPendingCleanup.count(hSrcEdit) == 0) {
+                    Ne_RebuildHRList(hSrcEdit);
+                    InvalidateRect(hSrcEdit, NULL, FALSE);
+                }
             }
             if (wmEv == EN_VSCROLL) {
                 // Repaint line-number gutter on vertical scroll.

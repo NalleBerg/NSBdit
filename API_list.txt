@@ -79,6 +79,26 @@
                                                 with ShellExecuteW.
                                                 ENM_LINK on all EM_SETEVENTMASK calls;
                                                 EN_LINK fallback handler in WM_NOTIFY.
+                                                WM_KEYDOWN VK_DELETE/VK_BACK: detects
+                                                adjacent HR paragraph and calls
+                                                Ne_DeleteHRule instead of default edit.
+                                                WM_CHAR '\r': sets g_hrPendingCleanup
+                                                flag, calls through, posts
+                                                NE_WM_HR_CLEANUP (WM_APP+1) with
+                                                enterPos in wParam.
+                                                NE_WM_HR_CLEANUP: strips inherited HR
+                                                format from paragraph at enterPos (if
+                                                any), then calls Ne_RebuildHRList.
+                                                Horizontal Rule (HR): Ne_InsertHRule /
+                                                Ne_PaintHRules / Ne_RebuildHRList /
+                                                Ne_DeleteHRule / Ne_ShowHRulePropsDialog.
+                                                g_hrMap (HWND → vector<NeHRuleEntry>)
+                                                caches charIdx + style/colour per HR.
+                                                g_hrPendingCleanup (HWND → set<LONG>)
+                                                used as re-entrancy flag during '\r'.
+                                                EN_CHANGE always calls Ne_RebuildHRList
+                                                (unless g_hrPendingCleanup flag set).
+                                                See hrule_INTERNALS.txt for full detail.
                                                 External file-change detection on
                                                 editor focus: compares current file's
                                                 last-write time + size against the
@@ -235,6 +255,16 @@
                                                 checkboxes/radios — attach tip string via
                                                 SetPropW(L"avTip") and read in one shared proc;
                                                 Win32 TOOLTIPS_CLASS unreliable for these controls.
+
+  API_INTERNALS\INTERNALS\hrule_INTERNALS.txt  Horizontal Rule implementation internals —
+                                                NeHRuleEntry struct, g_hrMap / g_hrPendingCleanup,
+                                                Ne_RebuildHRList algorithm, Ne_PaintHRules
+                                                (EM_POSFROMCHAR overlay), Ne_InsertHRule
+                                                (pfClean pattern), NE_WM_HR_CLEANUP
+                                                (enterPos-based approach), and full bug
+                                                history: stale-charIdx strike-through fix;
+                                                Enter-erases-HR fix (re-entrant EM_EXSETSEL
+                                                during mid-split); Ctrl+Z restore fix.
 
   API_INTERNALS\INTERNALS\tab_editor_INTERNALS.txt
                                                 Tabbed-editor architecture reference for

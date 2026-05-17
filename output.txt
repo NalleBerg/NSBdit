@@ -2,7 +2,7 @@
 C:\Users\NalleBerg\Documents\C++\Workspace\NSBEdit>setlocal
 
 C:\Users\NalleBerg\Documents\C++\Workspace\NSBEdit>taskkill /F /IM NSBEdit.exe  2>&1 
-SUCCESS: The process "NSBEdit.exe" with PID 18852 has been terminated.
+SUCCESS: The process "NSBEdit.exe" with PID 17708 has been terminated.
 
 C:\Users\NalleBerg\Documents\C++\Workspace\NSBEdit>timeout /T 1 /NOBREAK  1>nul 
 
@@ -18,7 +18,18 @@ C:\Users\NalleBerg\Documents\C++\Workspace\NSBEdit>gcc -O2 -c curl\lib\quic_stub
 
 C:\Users\NalleBerg\Documents\C++\Workspace\NSBEdit>if 0 NEQ 0 (echo [ERROR] quic_stubs compile failed   & pause   & exit /b 1  ) 
 
-C:\Users\NalleBerg\Documents\C++\Workspace\NSBEdit>g++ -std=c++17 -O2 -mwindows -municode     -I. -Isqlite3 -Icurl\include     -DCURL_STATICLIB     -Iscintilla_src\scintilla\include -Ilexilla_src\lexilla\include     NSBEdit.cpp ne_tabs.cpp ne_statusbar.cpp dpi.cpp tooltip\tooltip.cpp scroll\my_scrollbar_vscroll.cpp     highlight\highlight.cpp checkbox.cpp     ne_crypto.cpp ne_profiles.cpp ne_ftp.cpp ne_autocomplete\ne_autocomplete.cpp     rtf2html\ne_rtf2html_lib.cpp     sqlite3\sqlite3.o curl\lib\quic_stubs.o NSBEdit.res     -lcomctl32 -lcomdlg32 -lshell32 -lole32 -luuid -luser32 -lgdi32 -lgdiplus -lwinspool     -Lscintilla_src\scintilla\bin -Llexilla_src\lexilla\bin -lscintilla -llexilla     -limm32 -loleaut32 -ladvapi32 -lole32 -luuid     -Lcurl\lib -lcurl -lssh2 -lssl -lcrypto -lz -lnghttp2 -lbrotlidec -lbrotlicommon -lpsl -lzstd     -lws2_32 -lcrypt32 -lbcrypt -lwinhttp -lwldap32 -lsecur32 -liphlpapi -lntdll     -static -static-libgcc -static-libstdc++     -o NSBEdit.exe 
+C:\Users\NalleBerg\Documents\C++\Workspace\NSBEdit>g++ -std=c++17 -O2 -mwindows -municode     -I. -Isqlite3 -Icurl\include     -DCURL_STATICLIB     -Iscintilla_src\scintilla\include -Ilexilla_src\lexilla\include     NSBEdit.cpp ne_tabs.cpp ne_statusbar.cpp dpi.cpp tooltip\tooltip.cpp scroll\my_scrollbar_vscroll.cpp     highlight\highlight.cpp checkbox.cpp     ne_crypto.cpp ne_profiles.cpp ne_ftp.cpp ne_autocomplete\ne_autocomplete.cpp     rtf2html\ne_rtf2html_lib.cpp     sqlite3\sqlite3.o curl\lib\quic_stubs.o NSBEdit.res     -lcomctl32 -lcomdlg32 -lshell32 -lole32 -luuid -luser32 -lgdi32 -lgdiplus -lwinspool -lmsimg32     -Lscintilla_src\scintilla\bin -Llexilla_src\lexilla\bin -lscintilla -llexilla     -limm32 -loleaut32 -ladvapi32 -lole32 -luuid     -Lcurl\lib -lcurl -lssh2 -lssl -lcrypto -lz -lnghttp2 -lbrotlidec -lbrotlicommon -lpsl -lzstd     -lws2_32 -lcrypt32 -lbcrypt -lwinhttp -lwldap32 -lsecur32 -liphlpapi -lntdll     -static -static-libgcc -static-libstdc++     -o NSBEdit.exe 
+NSBEdit.cpp: In function 'void Ne_InsertHRule(HWND, HWND)':
+NSBEdit.cpp:4193:24: error: 'g_hrMap' was not declared in this scope
+ 4193 |         for (auto& e : g_hrMap[hEdit]) {
+      |                        ^~~~~~~
+NSBEdit.cpp: In function 'void Ne_EditHRuleProps(HWND, HWND)':
+NSBEdit.cpp:4210:20: error: 'g_hrMap' was not declared in this scope
+ 4210 |     for (auto& e : g_hrMap[hEdit]) {
+      |                    ^~~~~~~
+NSBEdit.cpp:4217:20: error: 'g_hrMap' was not declared in this scope
+ 4217 |     for (auto& e : g_hrMap[hEdit]) {
+      |                    ^~~~~~~
 In file included from rtf2html\ne_rtf2html_lib.cpp:18:
 rtf2html\rtf_table.cpp: In member function 'std::string table::make()':
 rtf2html\rtf_table.cpp:92:48: warning: 'std::mem_fun1_t<_Ret, _Tp, _Arg> std::mem_fun(_Ret (_Tp::*)(_Arg)) [with _Ret = bool; _Tp = table_cell_def; _Arg = int]' is deprecated: use 'std::mem_fn' instead [-Wdeprecated-declarations]
@@ -75,14 +86,6 @@ C:/mingw64/lib/gcc/x86_64-w64-mingw32/15.2.0/include/c++/backward/binders.h:172:
   172 |     bind2nd(const _Operation& __fn, const _Tp& __x)
       |     ^~~~~~~
 
-C:\Users\NalleBerg\Documents\C++\Workspace\NSBEdit>if 0 NEQ 0 (echo.   & echo BUILD FAILED   & pause   & exit /b 1  ) 
-
-C:\Users\NalleBerg\Documents\C++\Workspace\NSBEdit>copy /Y NSB.png NSB.png  1>nul 
-
-C:\Users\NalleBerg\Documents\C++\Workspace\NSBEdit>copy /Y curver.txt curver.txt  1>nul 2>&1 
-
-C:\Users\NalleBerg\Documents\C++\Workspace\NSBEdit>echo.
-
-
-C:\Users\NalleBerg\Documents\C++\Workspace\NSBEdit>echo Done - NSBEdit.exe updated 
-Done - NSBEdit.exe updated
+C:\Users\NalleBerg\Documents\C++\Workspace\NSBEdit>if 1 NEQ 0 (echo.   & echo BUILD FAILED   & pause   & exit /b 1  ) 
+ 
+BUILD FAILED 

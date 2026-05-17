@@ -1,5 +1,10 @@
 # Changelog
 
+## v2026.05.17.15 - 17.05.2026 15:07
+
+- **Horizontal Rule (HR) in RTF documents**: HR paragraphs render as a custom-drawn line across the editor in one of six styles — single, thick, double, dotted, dashed, or hairline. Colour (solid or gradient), width %, and left/right indent are configurable via a properties dialog. Core functions: `Ne_InsertHRule`, `Ne_PaintHRules`, `Ne_RebuildHRList` (`g_hrMap` HWND→entry cache), `Ne_DeleteHRule`, `Ne_ShowHRulePropsDialog`. Drawing is overlaid via `GetDC` after `CallWindowProc` in `WM_PAINT` (avoids nested-`BeginPaint` clip conflicts). HR behaves like a character that occupies its whole line: Delete at the end of the line above or Backspace at the start of the line below deletes it; pressing Enter on any line above an HR moves it one line down; Ctrl+Z correctly restores a deleted HR. Three bugs fixed during development: (a) typing on a line above the HR used to draw the HR through the text — `EN_CHANGE → Ne_RebuildHRList` now keeps `charIdx` current; (b) pressing Enter above the HR used to erase it — `NE_WM_HR_CLEANUP` (posted via `PostMessageW`) now receives `enterPos` in `wParam` and strips only the paragraph at that position if it inherited HR format, keeping the undo chain intact and avoiding re-entrant `EM_EXSETSEL` calls during mid-split RichEdit processing; (c) `Ctrl+Z` after deleting an HR now correctly redraws it — the `EN_CHANGE` guard that skipped `Ne_RebuildHRList` when `g_hrMap` was empty has been removed.
+- **Status bar shows "Rich text"** on RTF/RichEdit tabs alongside the word and character count.
+
 ## v2026.05.16.14 - 16.05.2026 14:32
 
 - **Export as HTML 5…** (Convert menu, RTF only): converts active RTF to self-contained HTML5 with base64-embedded images. Uses `rtf2html/ne_rtf2html_lib.cpp` wrapper. Fixes: `\*\picprop` groups inside `\pict` are now skipped (their property names contain hex-like letters that were corrupting image data); `char_by_code()` in `rtf_tools.h` now emits proper UTF-8 (CP1252 → Unicode → UTF-8) instead of raw bytes — Norwegian/non-ASCII characters now render correctly. Menu item greyed for non-RTF tabs.

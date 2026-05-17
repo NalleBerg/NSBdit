@@ -1,6 +1,6 @@
 # NSBEdit
 
-A lightweight, standalone RTF notepad for Windows. **v2026.05.16.14**
+A lightweight, standalone RTF notepad for Windows. **v2026.05.17.15**
 
 ## Download
 
@@ -42,6 +42,7 @@ Just grab **[NSBEdit.exe](NSBEdit.exe)** — no installer, no extra files, no de
 - **Auto-close bracket and quote pairs** — typing `{`, `[`, `(`, `"`, `'`, or `«` inserts the matching closer and places the caret between them; typing a closing character when the same closer already follows the caret jumps over it. Works in both RichEdit and Scintilla editors
 - **Save to FTP** (File → Save to FTP…) — upload the active document to any connected FTP server; a profile-picker list lets you choose any connected server explicitly (useful to deploy a file to a different server). Browse the remote tree, enter a filename, click Save here. Connection stays open after upload
 - **Export as HTML 5** (Convert → Export as HTML 5…, RTF documents only) — converts the active RTF document to a self-contained HTML5 file with all images embedded as base64 data URIs. Norwegian and other non-ASCII characters are encoded correctly as UTF-8
+- **Horizontal Rule** — insert a styled divider line (single, thick, double, dotted, dashed, or hairline) via the toolbar. Colour, width %, and indent are configurable. Behaves like a character: Delete or Backspace from the adjacent line removes it; Enter above moves it down; Ctrl+Z restores it
 - **RTF formatting toolbar shown on startup** — the app opens with the Rich Text toolbar active without needing to open a file first
 - **File → Open reuses blank tab** — opening a file when the only open tab is a fresh untitled one loads into that tab rather than creating an extra blank alongside it
 

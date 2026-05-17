@@ -27,7 +27,7 @@ g++ -std=c++17 -O2 -mwindows -municode ^
     ne_crypto.cpp ne_profiles.cpp ne_ftp.cpp ne_autocomplete\ne_autocomplete.cpp ^
     rtf2html\ne_rtf2html_lib.cpp ^
     sqlite3\sqlite3.o curl\lib\quic_stubs.o NSBEdit.res ^
-    -lcomctl32 -lcomdlg32 -lshell32 -lole32 -luuid -luser32 -lgdi32 -lgdiplus -lwinspool ^
+    -lcomctl32 -lcomdlg32 -lshell32 -lole32 -luuid -luser32 -lgdi32 -lgdiplus -lwinspool -lmsimg32 ^
     -Lscintilla_src\scintilla\bin -Llexilla_src\lexilla\bin -lscintilla -llexilla ^
     -limm32 -loleaut32 -ladvapi32 -lole32 -luuid ^
     -Lcurl\lib -lcurl -lssh2 -lssl -lcrypto -lz -lnghttp2 -lbrotlidec -lbrotlicommon -lpsl -lzstd ^
