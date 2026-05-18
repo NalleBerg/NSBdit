@@ -1,23 +1,54 @@
-@echo on
-setlocal
+@echo off
+setlocal enabledelayedexpansion
+echo ============================================================
+echo  NSBEdit build started
+echo ============================================================
 
-:: Kill running instance so exe can be replaced
-taskkill /F /IM NSBEdit.exe 2>&1
-timeout /T 1 /NOBREAK >nul
+:: ── Kill running instance ────────────────────────────────────
+echo [1/5] Killing running NSBEdit.exe (if any)...
+taskkill /F /IM NSBEdit.exe >nul 2>&1
+if !ERRORLEVEL! equ 0 (
+    echo       Killed. Waiting for file handles to release...
+    timeout /T 1 /NOBREAK >nul
+) else (
+    echo       Not running, nothing to kill.
+)
+echo.
 
-:: Compile resource
+:: ── Compile resource ─────────────────────────────────────────
+echo [2/5] Compiling resource (windres)...
 windres NSBEdit.rc -o NSBEdit.res --output-format=coff
-if %ERRORLEVEL% neq 0 ( echo [ERROR] windres failed & pause & exit /b 1 )
+if !ERRORLEVEL! neq 0 (
+    echo [ERROR] windres FAILED  ^(exit code !ERRORLEVEL!^)
+    exit /b 1
+)
+echo       Done.
+echo.
 
-:: Compile sqlite3 as C
+:: ── Compile sqlite3 ──────────────────────────────────────────
+echo [3/5] Compiling sqlite3...
 gcc -O2 -DSQLITE_THREADSAFE=0 -DSQLITE_DEFAULT_MEMSTATUS=0 -c sqlite3\sqlite3.c -o sqlite3\sqlite3.o
-if %ERRORLEVEL% neq 0 ( echo [ERROR] sqlite3 compile failed & pause & exit /b 1 )
+if !ERRORLEVEL! neq 0 (
+    echo [ERROR] sqlite3 compile FAILED  ^(exit code !ERRORLEVEL!^)
+    exit /b 1
+)
+echo       Done.
+echo.
 
-:: Compile QUIC stubs (satisfies ngtcp2/nghttp3 refs in libcurl; never called at runtime)
+:: ── Compile QUIC stubs ───────────────────────────────────────
+echo [4/5] Compiling QUIC stubs...
 gcc -O2 -c curl\lib\quic_stubs.c -o curl\lib\quic_stubs.o
-if %ERRORLEVEL% neq 0 ( echo [ERROR] quic_stubs compile failed & pause & exit /b 1 )
+if !ERRORLEVEL! neq 0 (
+    echo [ERROR] quic_stubs compile FAILED  ^(exit code !ERRORLEVEL!^)
+    exit /b 1
+)
+echo       Done.
+echo.
 
-:: Compile and link
+:: ── Compile + link NSBEdit ───────────────────────────────────
+echo [5/5] Compiling and linking NSBEdit.cpp...
+echo       (this is the slow step - warnings and errors appear below)
+echo ............................................................
 g++ -std=c++17 -O2 -mwindows -municode ^
     -I. -Isqlite3 -Icurl\include ^
     -DCURL_STATICLIB ^
@@ -34,12 +65,19 @@ g++ -std=c++17 -O2 -mwindows -municode ^
     -lws2_32 -lcrypt32 -lbcrypt -lwinhttp -lwldap32 -lsecur32 -liphlpapi -lntdll ^
     -static -static-libgcc -static-libstdc++ ^
     -o NSBEdit.exe
+echo ............................................................
+if !ERRORLEVEL! neq 0 (
+    echo.
+    echo [ERROR] Compile/link FAILED  ^(exit code !ERRORLEVEL!^)
+    exit /b 1
+)
+echo       Done.
+echo.
 
-if %ERRORLEVEL% neq 0 ( echo. & echo BUILD FAILED & pause & exit /b 1 )
-
-::Keep runtime assets alongside the exe (already in repo; no-op copy)
-copy /Y NSB.png NSB.png >nul
+:: ── Assets ───────────────────────────────────────────────────
+copy /Y NSB.png NSB.png >nul 2>&1
 copy /Y curver.txt curver.txt >nul 2>&1
 
-echo.
-echo Done - NSBEdit.exe updated
+echo ============================================================
+echo  BUILD SUCCEEDED  --  NSBEdit.exe updated
+echo ============================================================

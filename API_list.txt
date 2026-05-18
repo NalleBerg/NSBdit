@@ -137,6 +137,15 @@
                                                 SCN_UPDATEUI -> msb_sync keeps thumb in
                                                 sync. Ne_AttachScrollbars also called in
                                                 RTF branch of Ne_LoadPathIntoEditor.
+                                                Word wrap indicator: Ne_DrawSciWrapIndicators
+                                                draws a teal-green ↵ glyph to the left of
+                                                the MSB scrollbar for every wrapped visual
+                                                sub-line; called from WM_NOTIFY →
+                                                SCN_PAINTED (fires after each Scintilla
+                                                paint). Right boundary queried via
+                                                msb_get_bar_hwnd to avoid WS_CLIPSIBLINGS
+                                                clipping. Ne_SciWrapSubclassProc handles
+                                                only WM_NCDESTROY (cleanup).
                                                 Auto-close bracket/quote pairs:
                                                 Ne_SciAutoPair (called from SCN_CHARADDED)
                                                 — opener {[('"« inserts closer, caret
@@ -173,7 +182,10 @@
                                                 (no content swapping). Tab captions show
                                                 filename with owner-drawn × close glyph
                                                 (hover = red circle). [+] button opens
-                                                new tab. Right-click tab strip shows
+                                                new tab; WM_PAINT calls RedrawWindow on
+                                                hBtnNew after tab strip is drawn to prevent
+                                                theming overdraw from permanently erasing
+                                                it. Right-click tab strip shows
                                                 New Tab / Close Tab context menu.
                                                 NE_WM_TABCLOSE / NE_WM_TABNEW posted to
                                                 parent. Keyboard: Ctrl+Tab cycle, Ctrl+W

@@ -1,5 +1,11 @@
 # Changelog
 
+## v2026.05.18.12 - 18.05.2026 12:19
+
+- **Scintilla word wrap ↵ indicator**: A teal-green ↵ glyph now appears at the right edge of every wrapped visual sub-line in Scintilla (code) tabs when word wrap is on. Implemented via `SCN_PAINTED` — Scintilla's documented post-paint notification — rather than a `WM_PAINT` subclass (Scintilla's own caret/selection repaints were overwriting the subclass overlay). The glyph is drawn to the left of the custom MSB vertical scrollbar; `WS_CLIPSIBLINGS` on the Scintilla window was silently clipping the previous attempt into invisibility. New helper: `Ne_DrawSciWrapIndicators(hSci)` called from `WM_NOTIFY → SCN_PAINTED`.
+- **[+] new-tab button always visible**: `NeTabs_TabProc` `WM_PAINT` now calls `RedrawWindow(hBtnNew, RDW_INVALIDATE | RDW_UPDATENOW)` after painting the tab strip, so the [+] button is never left erased when Windows theming overdraw covers the sibling button area.
+- **Edition 1 in About dialog**: The About dialog now shows `Edition: 1` below the version line. Locale key `ABOUT_EDITION` added to `locale/en_GB.txt`.
+
 ## v2026.05.18.09 - 18.05.2026 09:08
 
 - **Paragraph Spacing dialog restyled and fixed**: The Paragraph Spacing dialog (Format → Paragraph Spacing) now uses the app-standard owner-draw button system (`NeBtnTone` / `NeDialogButtonSpec` / `Ne_DrawDialogButton` / `Ne_BtnHoverProc`) with a white background, blue Save and red Cancel buttons, and hover-highlight. Root cause of Save/Cancel doing nothing fixed: the dialog class previously used `DefWindowProcW` as its `WndProc`, which silently discarded the `WM_COMMAND` sent synchronously by button clicks — the `GetMessageW` loop never saw it. The dialog now has a proper `Ne_ParSpaceDlgProc` that reads the spin-box values on IDOK, stores them in module-level statics, and calls `DestroyWindow`; the message loop exits when `IsWindow(dlg)` returns false, and the values are applied afterwards. All strings go through `Ls()` (i18n-correct: `DLG_PARSPACE`, `DLG_PARSPACE_BEF`, `DLG_PARSPACE_AFT`, `BTN_SAVE`, `BTN_CANCEL`).

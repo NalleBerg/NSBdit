@@ -1228,17 +1228,138 @@ static bool Ne_CaretOnHRule(HWND hEdit)
 static void Ne_InsertHRule(HWND hwnd, HWND hEdit);    // defined after Ne_ShowHRulePropsDialog
 static void Ne_EditHRuleProps(HWND hwnd, HWND hEdit);  // defined after Ne_ShowHRulePropsDialog
 static void Ne_RebuildHRList(HWND hEdit);              // defined near Ne_PaintHRules
+static bool s_wordWrapOn = true;                       // forward-declared for Ne_RichWrapSubclassProc
+
+// ── Soft-wrap indicator: draw dark-green ↲ at the end of each visually-wrapped line ──
+static LRESULT CALLBACK Ne_RichWrapSubclassProc(
+    HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam, UINT_PTR uid, DWORD_PTR /*data*/)
+{
+    if (msg == WM_PAINT && s_wordWrapOn) {
+        LRESULT r = DefSubclassProc(hwnd, msg, wParam, lParam);
+        int lineCount = (int)SendMessageW(hwnd, EM_GETLINECOUNT, 0, 0);
+        if (lineCount > 1) {
+            HDC hdc = GetDC(hwnd);
+            if (hdc) {
+                RECT cr; GetClientRect(hwnd, &cr);
+                HFONT hFont = (HFONT)SendMessageW(hwnd, WM_GETFONT, 0, 0);
+                HFONT hOldFont = hFont ? (HFONT)SelectObject(hdc, hFont) : NULL;
+                SetTextColor(hdc, RGB(0, 110, 0));
+                SetBkMode(hdc, TRANSPARENT);
+                TEXTMETRIC tm = {};
+                GetTextMetrics(hdc, &tm);
+                int lineH = tm.tmHeight;
+                for (int i = 0; i < lineCount - 1; ++i) {
+                    LONG li0 = (LONG)SendMessageW(hwnd, EM_LINEINDEX, i,     0);
+                    LONG li1 = (LONG)SendMessageW(hwnd, EM_LINEINDEX, i + 1, 0);
+                    if (li0 < 0 || li1 <= 0) continue;
+                    // If the char before line i+1 is NOT a real newline, line i is soft-wrapped
+                    TEXTRANGEW tr = {};
+                    wchar_t ch[2] = {};
+                    tr.chrg.cpMin = li1 - 1;
+                    tr.chrg.cpMax = li1;
+                    tr.lpstrText  = ch;
+                    SendMessageW(hwnd, EM_GETTEXTRANGE, 0, (LPARAM)&tr);
+                    if (ch[0] == L'\r' || ch[0] == L'\n') continue;
+                    // Get Y of this visual line
+                    POINTL pt = {};
+                    SendMessageW(hwnd, EM_POSFROMCHAR, (WPARAM)&pt, (LPARAM)li0);
+                    RECT rc = { cr.right - tm.tmAveCharWidth * 2, (int)pt.y,
+                                cr.right - 1, (int)pt.y + lineH };
+                    DrawTextW(hdc, L"\u21B2", 1, &rc, DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
+                }
+                if (hOldFont) SelectObject(hdc, hOldFont);
+                ReleaseDC(hwnd, hdc);
+            }
+        }
+        return r;
+    }
+    if (msg == WM_NCDESTROY)
+        RemoveWindowSubclass(hwnd, Ne_RichWrapSubclassProc, uid);
+    return DefSubclassProc(hwnd, msg, wParam, lParam);
+}
+static void Ne_InstallWrapSubclass(HWND hEdit)
+{
+    if (hEdit) SetWindowSubclass(hEdit, Ne_RichWrapSubclassProc, 1, 0);
+}
+
+// ── Scintilla wrap indicator: draw ↵ at the end of each wrapped visual line ──
+static LRESULT CALLBACK Ne_SciWrapSubclassProc(
+    HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam, UINT_PTR uid, DWORD_PTR /*data*/)
+{
+    if (msg == WM_NCDESTROY)
+        RemoveWindowSubclass(hwnd, Ne_SciWrapSubclassProc, uid);
+    return DefSubclassProc(hwnd, msg, wParam, lParam);
+}
+
+// Draw ↵ at the right edge of every wrapped visual sub-line in hSci.
+// Called from SCN_PAINTED so Scintilla has already finished its own paint.
+static void Ne_DrawSciWrapIndicators(HWND hSci)
+{
+    int firstVis = (int)SendMessageW(hSci, SCI_GETFIRSTVISIBLELINE, 0, 0);
+    int onScreen = (int)SendMessageW(hSci, SCI_LINESONSCREEN,       0, 0);
+    int lineH    = (int)SendMessageW(hSci, SCI_TEXTHEIGHT,          firstVis, 0);
+    if (lineH <= 0 || onScreen <= 0) return;
+    RECT cr; GetClientRect(hSci, &cr);
+
+    // Draw to the left of the custom vertical scrollbar (it is a WS_CLIPSIBLINGS
+    // sibling that overlaps the right edge, so GetDC drawing behind it is clipped).
+    int rightBound = cr.right;
+    {
+        auto iv = s_sciSbV.find(hSci);
+        if (iv != s_sciSbV.end() && iv->second) {
+            HWND hBar = msb_get_bar_hwnd(iv->second);
+            if (hBar && IsWindow(hBar)) {
+                RECT barRc; GetWindowRect(hBar, &barRc);
+                POINT sciOrig = {0, 0}; ClientToScreen(hSci, &sciOrig);
+                int sbLeft = (int)(barRc.left - sciOrig.x);
+                if (sbLeft > 0 && sbLeft < cr.right)
+                    rightBound = sbLeft - S(1);
+            }
+        }
+    }
+
+    HDC hdc = GetDC(hSci);
+    if (!hdc) return;
+    SetTextColor(hdc, RGB(0, 120, 80));
+    SetBkMode(hdc, TRANSPARENT);
+    int ht = -(MulDiv(9, GetDeviceCaps(hdc, LOGPIXELSY), 72));
+    HFONT hf = CreateFontW(ht, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+        CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
+    HFONT hOld = hf ? (HFONT)SelectObject(hdc, hf) : NULL;
+    SIZE sz = {}; GetTextExtentPoint32W(hdc, L"\u21B5", 1, &sz);
+    for (int i = 0; i < onScreen; ++i) {
+        int visLine     = firstVis + i;
+        int docLine     = (int)SendMessageW(hSci, SCI_DOCLINEFROMVISIBLE, visLine,     0);
+        int nextDocLine = (int)SendMessageW(hSci, SCI_DOCLINEFROMVISIBLE, visLine + 1, 0);
+        if (nextDocLine != docLine) continue; // last sub-line or un-wrapped line
+        int y = i * lineH;
+        RECT rc = { rightBound - sz.cx - S(2), y, rightBound, y + lineH };
+        DrawTextW(hdc, L"\u21B5", 1, &rc, DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
+    }
+    if (hOld) SelectObject(hdc, hOld);
+    if (hf)   DeleteObject(hf);
+    ReleaseDC(hSci, hdc);
+}
 
 // ── Toggle word wrap (wrap to window ↔ no wrap) ───────────────────────────────
-static bool s_wordWrapOn  = true;
 static void Ne_ToggleWordWrap(HWND hwnd, HWND hEdit)
 {
     s_wordWrapOn = !s_wordWrapOn;
-    // EM_SETTARGETDEVICE: 0 = wrap to window, large value = no wrap
-    SendMessageW(hEdit, EM_SETTARGETDEVICE, 0, s_wordWrapOn ? 0 : 30000);
+    NeTabDoc* doc = NeTabs_GetActiveDoc(hwnd);
+    if (doc && doc->hSci) {
+        // Scintilla: use SCI_SETWRAPMODE
+        SendMessageW(doc->hSci, SCI_SETWRAPMODE, s_wordWrapOn ? SC_WRAP_WORD : SC_WRAP_NONE, 0);
+    } else {
+        // RichEdit: EM_SETTARGETDEVICE (0 = wrap to window, large = no wrap)
+        SendMessageW(hEdit, EM_SETTARGETDEVICE, 0, s_wordWrapOn ? 0 : 30000);
+    }
     // Sync button state
     HWND hBtn = GetDlgItem(hwnd, IDC_NE_WORDWRAP);
-    if (hBtn) SendMessageW(hBtn, BM_SETCHECK, s_wordWrapOn ? BST_CHECKED : BST_UNCHECKED, 0);
+    if (hBtn) {
+        SendMessageW(hBtn, BM_SETCHECK, s_wordWrapOn ? BST_CHECKED : BST_UNCHECKED, 0);
+        InvalidateRect(hBtn, NULL, FALSE);
+    }
 }
 
 // ── Toggle character case: UPPER → lower → Title → UPPER ─────────────────────
@@ -5279,9 +5400,19 @@ static void Ne_New(HWND hwnd)
     NeTabs_UpdateTabTitle(hwnd, NeTabs_GetActiveIndex(hwnd));
     Ne_SyncScrollbarVisibility(hwnd);
     Ne_SyncRichGutters(hwnd);
-    // Apply saved zoom to the new RTF tab.
-    if (hEdit) SendMessageW(hEdit, EM_SETZOOM, (WPARAM)g_zoomRtf, 100);
+    // New RTF tabs always start with word wrap on.
+    s_wordWrapOn = true;
+    if (hEdit) {
+        SendMessageW(hEdit, EM_SETZOOM, (WPARAM)g_zoomRtf, 100);
+        SendMessageW(hEdit, EM_SETTARGETDEVICE, 0, 0); // wrap on
+    }
+    // Sync wrap button (toolbar may already be visible).
+    { HWND hWBtn = GetDlgItem(hwnd, IDC_NE_WORDWRAP);
+      if (hWBtn) { SendMessageW(hWBtn, BM_SETCHECK, BST_CHECKED, 0);
+                   RedrawWindow(hWBtn, NULL, NULL, RDW_INVALIDATE | RDW_ERASE | RDW_UPDATENOW); } }
 }
+
+static void Ne_UpdateToolbarMode(HWND hwnd); // defined below
 
 static bool Ne_LoadPathIntoEditor(HWND hwnd, const std::wstring& path)
 {
@@ -5349,6 +5480,7 @@ static bool Ne_LoadPathIntoEditor(HWND hwnd, const std::wstring& path)
             int w = rcEdit.right - rcEdit.left;
             int h = rcEdit.bottom - rcEdit.top;
             doc->hSci = Ne_CreateScintilla(hwnd, pt.x, pt.y, w, h);
+            if (doc->hSci) SetWindowSubclass(doc->hSci, Ne_SciWrapSubclassProc, 2, 0);
             Ne_AttachSciScrollbars(doc->hSci);
         }
 
@@ -5374,6 +5506,10 @@ static bool Ne_LoadPathIntoEditor(HWND hwnd, const std::wstring& path)
         // Hide the RichEdit gutter (Scintilla has its own built-in margin).
         Ne_SyncRichGutters(hwnd);
 
+        // Non-RTF files default to no wrap; reset global state and apply it.
+        s_wordWrapOn = false;
+        SendMessageW(doc->hSci, SCI_SETWRAPMODE, SC_WRAP_NONE, 0);
+
         doc->path = path;
         doc->modified = false;
         Ne_DetectEncoding(doc, bytes);
@@ -5397,8 +5533,10 @@ static bool Ne_LoadPathIntoEditor(HWND hwnd, const std::wstring& path)
     }
     Ne_AttachScrollbars(hEdit);
     ShowWindow(hEdit, SW_SHOW);
-    // Apply saved zoom to the RTF tab.
+    // RTF files always open with word wrap on.
+    s_wordWrapOn = true;
     SendMessageW(hEdit, EM_SETZOOM, (WPARAM)g_zoomRtf, 100);
+    SendMessageW(hEdit, EM_SETTARGETDEVICE, 0, 0); // wrap on
 
     std::string streamBytes = bytes;
     doc->suppressChange = true;
@@ -5449,6 +5587,7 @@ static void Ne_Open(HWND hwnd)
         return;
     }
 
+    Ne_UpdateToolbarMode(hwnd);
     HWND hEdit = NeTabs_GetActiveEdit(hwnd);
     if (hEdit) SetFocus(hEdit);
 }
@@ -5778,7 +5917,7 @@ static int Ne_LayoutToolbar(HWND hwnd, int cW, int topY)
     const int pad   = S(8);
     const int bSz   = S(26);
     const int bG    = S(3);
-    const int sG    = S(8);
+    const int sG    = S(16);
     const int wXs   = bSz + S(4);
     const int wAl   = bSz + S(4);
     const int wCol  = bSz + S(10);
@@ -5963,6 +6102,10 @@ static void Ne_UpdateToolbarMode(HWND hwnd)
 
     Ne_ShowToolbarButtons(hwnd, mode);
     st->toolbarMode = mode;
+    // Keep wrap button in sync with current state.
+    { HWND hWBtn = GetDlgItem(hwnd, IDC_NE_WORDWRAP);
+      if (hWBtn) { SendMessageW(hWBtn, BM_SETCHECK, s_wordWrapOn ? BST_CHECKED : BST_UNCHECKED, 0);
+                   RedrawWindow(hWBtn, NULL, NULL, RDW_INVALIDATE | RDW_ERASE | RDW_UPDATENOW); } }
 
     RECT rc; GetClientRect(hwnd, &rc);
     int cW = rc.right;
@@ -8122,6 +8265,8 @@ static void ShowNsbAboutDialog(HWND parent)
     AppendNsbRich(hEdit, (published + L"\r\n").c_str(), false, RGB(0,0,0), 0, true);
     AppendNsbRich(hEdit, Ls(L"ABOUT_VERSION"),   true,  RGB(0,0,0), 0, true);
     AppendNsbRich(hEdit, (version   + L"\r\n").c_str(), false, RGB(0,0,0), 0, true);
+    AppendNsbRich(hEdit, Ls(L"ABOUT_EDITION"),   true,  RGB(0,0,0), 0, true);
+    AppendNsbRich(hEdit, L"1\r\n",                false, RGB(0,0,0), 0, true);
     AppendNsbRich(hEdit, L"\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\r\n\r\n", false, RGB(180,20,20), 0, true);
     AppendNsbRich(hEdit, Ls(L"ABOUT_DESC"),    false, RGB(40,40,40), 0, false);
     AppendNsbRich(hEdit, Ls(L"ABOUT_LICENSE"), true,  RGB(0,70,140), 0, false);
@@ -8512,6 +8657,7 @@ static LRESULT CALLBACK Ne_WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
         tp.pad = pad;
         tp.tabHeight = st->tabH;
         tp.untitledLabel = Ls(L"UNTITLED");
+        tp.pfnEditCreated = Ne_InstallWrapSubclass;
         NeTabs_Create(tp);
         NeTabs_SetContextLabels(hwnd, Ls(L"TAB_CTX_NEW_TAB"), Ls(L"TAB_CTX_CLOSE_TAB"));
         st->editX = pad; st->editW = cW - 2 * pad; st->editH = std::max(1, editH);
@@ -8810,6 +8956,7 @@ static LRESULT CALLBACK Ne_WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
                 int w = rcEdit.right - rcEdit.left;
                 int h = rcEdit.bottom - rcEdit.top;
                 doc->hSci = Ne_CreateScintilla(hwnd, pt.x, pt.y, w, h);
+                if (doc->hSci) SetWindowSubclass(doc->hSci, Ne_SciWrapSubclassProc, 2, 0);
                 Ne_AttachSciScrollbars(doc->hSci);
                 if (!doc->hSci) return 0;
                 SendMessageW(doc->hSci, SCI_SETTEXT, 0, (LPARAM)utf8.c_str());
@@ -9318,6 +9465,8 @@ static LRESULT CALLBACK Ne_WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
                     g_zoomSci = (int)SendMessageW(hSciActive, SCI_GETZOOM, 0, 0);
                     NeProfiles_SetIntSetting("zoom_sci", g_zoomSci);
                 }
+            } else if (scn->nmhdr.code == SCN_PAINTED && s_wordWrapOn) {
+                Ne_DrawSciWrapIndicators((HWND)scn->nmhdr.hwndFrom);
             }
         }
         break;
@@ -9475,15 +9624,28 @@ static LRESULT CALLBACK Ne_WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
             bool   pressed  = (dis->itemState & ODS_SELECTED) != 0;
             bool   disabled = (dis->itemState & ODS_DISABLED) != 0;
             // For toggle buttons track checked state via BM_GETCHECK.
-            bool   checked  = (SendMessageW(dis->hwndItem, BM_GETCHECK, 0, 0) == BST_CHECKED);
+            // Exception: IDC_NE_WORDWRAP uses s_wordWrapOn directly because
+            // BM_GETCHECK on a plain BS_OWNERDRAW button is unreliable.
+            bool   checked;
+            if (id == IDC_NE_WORDWRAP)
+                checked = s_wordWrapOn;
+            else
+                checked = (SendMessageW(dis->hwndItem, BM_GETCHECK, 0, 0) == BST_CHECKED);
             RECT   rc       = dis->rcItem;
 
             // Background.
             COLORREF bg;
-            if      (pressed && checked) bg = RGB(155, 190, 235);
-            else if (pressed)            bg = RGB(185, 215, 250);
-            else if (checked)            bg = RGB(210, 230, 255);
-            else                         bg = GetSysColor(COLOR_BTNFACE);
+            if (id == IDC_NE_WORDWRAP) {
+                if      (pressed && checked) bg = RGB(100, 195, 145);
+                else if (pressed)            bg = RGB(185, 215, 250);
+                else if (checked)            bg = RGB(175, 235, 205);
+                else                         bg = GetSysColor(COLOR_BTNFACE);
+            } else {
+                if      (pressed && checked) bg = RGB(155, 190, 235);
+                else if (pressed)            bg = RGB(185, 215, 250);
+                else if (checked)            bg = RGB(210, 230, 255);
+                else                         bg = GetSysColor(COLOR_BTNFACE);
+            }
 
             HBRUSH hbr = CreateSolidBrush(bg);
             FillRect(dis->hDC, &rc, hbr);
@@ -9522,6 +9684,25 @@ static LRESULT CALLBACK Ne_WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
                 HBRUSH hSw = CreateSolidBrush(RGB(255, 220, 0));
                 FillRect(dis->hDC, &swRc, hSw);
                 DeleteObject(hSw);
+            } else
+            // ── Special: Word wrap — render ↵ larger and bold ─────────────────
+            if (id == IDC_NE_WORDWRAP) {
+                COLORREF fg = disabled ? GetSysColor(COLOR_GRAYTEXT)
+                            : checked  ? RGB(0, 120, 80)
+                            :            RGB(80, 80, 80);
+                SetTextColor(dis->hDC, fg);
+                SetBkMode(dis->hDC, TRANSPARENT);
+                int ht = -(MulDiv(16, GetDeviceCaps(dis->hDC, LOGPIXELSY), 72));
+                HFONT hf = CreateFontW(ht, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
+                                       DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                                       CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
+                if (!hf) hf = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+                HFONT hOld = (HFONT)SelectObject(dis->hDC, hf);
+                RECT rcTxt = { rc.left + (pressed?1:0), rc.top + (pressed?1:0),
+                               rc.right, rc.bottom };
+                DrawTextW(dis->hDC, L"\u21B5", -1, &rcTxt, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+                SelectObject(dis->hDC, hOld);
+                DeleteObject(hf);
             } else {
                 // Coloured text for all other buttons.
                 wchar_t txt[64] = {};
@@ -9535,7 +9716,7 @@ static LRESULT CALLBACK Ne_WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
                 bool  createdFont = false;
                 if (!hf) {
                     // Use Segoe UI so all Unicode glyphs (◂ ▸ ↵ etc.) render correctly.
-                    int ht = -(MulDiv(10, GetDeviceCaps(dis->hDC, LOGPIXELSY), 72));
+                    int ht = -(MulDiv(11, GetDeviceCaps(dis->hDC, LOGPIXELSY), 72));
                     hf = CreateFontW(ht, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
                                      DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
                                      CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");

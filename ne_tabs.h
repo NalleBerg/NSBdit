@@ -40,6 +40,7 @@ struct NeTabsCreateParams {
     int pad = 0;
     int tabHeight = 0;
     const wchar_t* untitledLabel = L"Untitled";
+    void (*pfnEditCreated)(HWND hEdit) = nullptr; // called whenever a new RichEdit is created
 };
 
 bool NeTabs_Create(const NeTabsCreateParams& p);
@@ -78,3 +79,6 @@ void NeTabs_SetRects(HWND hwndParent,
     int editX, int editY, int editW, int editH);
 
 HWND NeTabs_GetActiveScintilla(HWND hwndParent);
+
+// Scroll the tab strip left (forward=false) or right (forward=true).
+

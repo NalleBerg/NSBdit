@@ -12,7 +12,7 @@
 struct NeTabsState {
     HWND hwndParent = NULL;
     HWND hTab = NULL;
-    HWND hBtnNew = NULL;        // [+] new-tab button
+    HWND hBtnNew  = NULL;       // [+] new-tab button (follows last tab)
     WNDPROC tabPrevProc = NULL;
     std::vector<NeTabDoc> docs;
     int activeIndex = -1;
@@ -33,12 +33,15 @@ struct NeTabsState {
     std::wstring untitled = L"Untitled";
     std::wstring ctxNewTab  = L"New Tab";
     std::wstring ctxCloseTab = L"Close Tab";
+    void (*pfnEditCreated)(HWND hEdit) = nullptr;
 };
 
 static NeTabsState g_tabs;
 static bool g_tipTracking = false;
 static HWND g_tipTab = NULL;
 static int g_tipIndex = -1;
+
+static void NeTabs_RepositionBtnNew(); // forward declaration
 
 // IDs used inside the tab context menu
 #define NE_CTX_NEWTAB   1
@@ -172,6 +175,9 @@ static LRESULT CALLBACK NeTabs_TabProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
         // Let the system draw the tabs first, then overlay × glyphs.
         LRESULT r = CallWindowProcW(g_tabs.tabPrevProc, hwnd, msg, wParam, lParam);
         NeTabs_DrawCloseGlyphs(hwnd);
+        // Themed tab drawing can overdraw the sibling [+] button; repaint it now.
+        if (g_tabs.hBtnNew && IsWindowVisible(g_tabs.hBtnNew))
+            RedrawWindow(g_tabs.hBtnNew, NULL, NULL, RDW_INVALIDATE | RDW_UPDATENOW);
         return r;
     }
     case WM_MOUSEMOVE: {
@@ -259,6 +265,7 @@ static bool NeTabs_CreateEdit(NeTabDoc& d)
         WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_HSCROLL | ES_MULTILINE | ES_WANTRETURN | ES_AUTOVSCROLL,
         g_tabs.editX, g_tabs.editY, std::max(1, g_tabs.editW), std::max(1, g_tabs.editH),
         g_tabs.hwndParent, (HMENU)(UINT_PTR)g_tabs.editCtrlId, GetModuleHandleW(NULL), NULL);
+    if (d.hEdit && g_tabs.pfnEditCreated) g_tabs.pfnEditCreated(d.hEdit);
     return d.hEdit != NULL;
 }
 
@@ -272,6 +279,7 @@ bool NeTabs_Create(const NeTabsCreateParams& p)
     g_tabs.tabHeight = p.tabHeight;
     g_tabs.untitled = p.untitledLabel ? p.untitledLabel : L"Untitled";
     g_tabs.richEditClass = p.richEditClass ? p.richEditClass : L"RICHEDIT50W";
+    g_tabs.pfnEditCreated = p.pfnEditCreated;
 
     g_tabs.hTab = CreateWindowExW(0, WC_TABCONTROLW, L"",
         WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS,
@@ -279,8 +287,8 @@ bool NeTabs_Create(const NeTabsCreateParams& p)
         g_tabs.hwndParent, (HMENU)(UINT_PTR)g_tabs.tabCtrlId, p.hInst, NULL);
     if (!g_tabs.hTab) return false;
 
-    // [+] new-tab button sits to the right of the tab strip
     int btnW = g_tabs.tabHeight;
+    // [+] new-tab button: positioned dynamically after the last tab
     g_tabs.hBtnNew = CreateWindowExW(0, L"BUTTON", L"+",
         WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
         0, 0, btnW, g_tabs.tabHeight,
@@ -314,7 +322,7 @@ void NeTabs_Destroy(HWND hwndParent)
         d.hSci  = NULL;
     }
     g_tabs.docs.clear();
-    if (g_tabs.hBtnNew && IsWindow(g_tabs.hBtnNew)) DestroyWindow(g_tabs.hBtnNew);
+    if (g_tabs.hBtnNew  && IsWindow(g_tabs.hBtnNew))  DestroyWindow(g_tabs.hBtnNew);
     if (g_tabs.hTab && IsWindow(g_tabs.hTab)) {
         if (g_tabs.tabPrevProc)
             SetWindowLongPtrW(g_tabs.hTab, GWLP_WNDPROC, (LONG_PTR)g_tabs.tabPrevProc);
@@ -347,6 +355,7 @@ bool NeTabs_SetActive(HWND hwndParent, int index)
     NeTabs_ShowOnlyActive();
     HWND focusTarget = g_tabs.docs[index].hSci ? g_tabs.docs[index].hSci : g_tabs.docs[index].hEdit;
     SetFocus(focusTarget);
+    NeTabs_RepositionBtnNew();
     return true;
 }
 
@@ -404,6 +413,7 @@ bool NeTabs_AddUntitled(HWND hwndParent)
     ti.pszText = (LPWSTR)t.c_str();
     TabCtrl_InsertItem(g_tabs.hTab, idx, &ti);
 
+    NeTabs_RepositionBtnNew();
     return NeTabs_SetActive(hwndParent, idx);
 }
 
@@ -431,6 +441,7 @@ bool NeTabs_CloseTab(HWND hwndParent, int index)
 
     TabCtrl_SetCurSel(g_tabs.hTab, g_tabs.activeIndex);
     NeTabs_ShowOnlyActive();
+    NeTabs_RepositionBtnNew();
     SetFocus(g_tabs.docs[g_tabs.activeIndex].hEdit);
     return true;
 }
@@ -459,6 +470,7 @@ void NeTabs_UpdateTabTitle(HWND hwndParent, int index)
     std::wstring t = NeTabs_TitleFor(g_tabs.docs[index], g_tabs.untitled);
     ti.pszText = (LPWSTR)t.c_str();
     TabCtrl_SetItem(g_tabs.hTab, index, &ti);
+    NeTabs_RepositionBtnNew();
 }
 
 void NeTabs_UpdateAllTitles(HWND hwndParent)
@@ -494,6 +506,44 @@ void NeTabs_ShowTabContextMenu(HWND hwndParent, int screenX, int screenY, int ta
         PostMessageW(hwndParent, NE_WM_TABCLOSE, (WPARAM)tabIndex, 0);
 }
 
+// Position [+] immediately after the last tab item.
+// Called after the tab control has been laid out.
+static void NeTabs_RepositionBtnNew()
+{
+    if (!g_tabs.hBtnNew || !g_tabs.hTab) return;
+    int count = (int)g_tabs.docs.size();
+    if (count == 0) return;
+
+    // Force the tab control to recalculate its internal tab layout before we
+    // query item rects.  Sending WM_SIZE with the current client dimensions
+    // triggers the tab control's own layout pass; a plain InvalidateRect/
+    // UpdateWindow only causes a repaint and does not update the item rects.
+    RECT rcTabClient;
+    GetClientRect(g_tabs.hTab, &rcTabClient);
+    SendMessageW(g_tabs.hTab, WM_SIZE, SIZE_RESTORED,
+                 MAKELPARAM(rcTabClient.right, rcTabClient.bottom));
+
+    RECT r = {};
+    if (!TabCtrl_GetItemRect(g_tabs.hTab, count - 1, &r)) return;
+
+    // Map last tab's right edge to parent coordinates.
+    POINT pt = { r.right, 0 };
+    MapWindowPoints(g_tabs.hTab, g_tabs.hwndParent, &pt, 1);
+
+    int btnW = g_tabs.tabH;
+    int btnX = pt.x + S(2);
+    // Right boundary: full tab row width
+    int boundary = g_tabs.tabX + g_tabs.tabW;
+
+    if (btnX + btnW > boundary) {
+        ShowWindow(g_tabs.hBtnNew, SW_HIDE);
+    } else {
+        ShowWindow(g_tabs.hBtnNew, SW_SHOW);
+        SetWindowPos(g_tabs.hBtnNew, NULL, btnX, g_tabs.tabY,
+                     btnW, g_tabs.tabH, SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+}
+
 void NeTabs_SetRects(HWND hwndParent,
     int tabX, int tabY, int tabW, int tabH,
     int editX, int editY, int editW, int editH)
@@ -503,16 +553,10 @@ void NeTabs_SetRects(HWND hwndParent,
     g_tabs.tabX = tabX; g_tabs.tabY = tabY; g_tabs.tabW = tabW; g_tabs.tabH = tabH;
     g_tabs.editX = editX; g_tabs.editY = editY; g_tabs.editW = editW; g_tabs.editH = editH;
 
-    // Reserve space for [+] button on the right of the tab strip
-    int btnW = tabH;
-    int tabCtrlW = std::max(1, tabW - btnW - S(2));
-
     if (g_tabs.hTab)
-        SetWindowPos(g_tabs.hTab, NULL, tabX, tabY, tabCtrlW, std::max(1, tabH), SWP_NOZORDER | SWP_NOACTIVATE);
+        SetWindowPos(g_tabs.hTab, NULL, tabX, tabY, std::max(1, tabW), std::max(1, tabH), SWP_NOZORDER | SWP_NOACTIVATE);
 
-    if (g_tabs.hBtnNew)
-        SetWindowPos(g_tabs.hBtnNew, NULL, tabX + tabCtrlW + S(2), tabY,
-                     btnW, std::max(1, tabH), SWP_NOZORDER | SWP_NOACTIVATE);
+    NeTabs_RepositionBtnNew();
 
     for (auto& d : g_tabs.docs) {
         if (d.hEdit)

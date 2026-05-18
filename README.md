@@ -1,6 +1,6 @@
 # NSBEdit
 
-A lightweight, standalone RTF notepad for Windows. **v2026.05.18.09**
+A lightweight, standalone RTF notepad for Windows. **v2026.05.18.12**
 
 ## Download
 
@@ -47,6 +47,8 @@ Just grab **[NSBEdit.exe](NSBEdit.exe)** — no installer, no extra files, no de
 - **File → Open reuses blank tab** — opening a file when the only open tab is a fresh untitled one loads into that tab rather than creating an extra blank alongside it
 - **Paragraph Spacing dialog** — set space before/after a paragraph in points (Format → Paragraph Spacing); owner-draw blue/red buttons, white background, fully i18n
 - **Line Spacing dialog** — choose Single, 1.5 lines, or Double line spacing (Format → Line Spacing); same owner-draw style, white background, radio buttons, fully i18n
+- **Word wrap ↵ indicator in code tabs** — a teal-green ↵ glyph marks every wrapped visual sub-line in Scintilla (code) tabs when word wrap is on, drawn to the left of the vertical scrollbar
+- **Edition 1** — About dialog now shows Edition: 1 below the version number
 
 ## Building from source
 

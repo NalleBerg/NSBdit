@@ -1,6 +1,14 @@
 <h2 style="text-align: center; background-color: #e8f4f8; padding: 15px; border-radius: 5px; margin-bottom: 20px;"><span style="color: #0066cc;">&#x1F4DD; NSBEdit &mdash; Standalone RTF Notepad</span></h2>
 <h3 style="text-align: center;">&nbsp;</h3>
-<p style="text-align: center; font-size: 14px; color: #666; margin-bottom: 30px;"><strong>Latest Update:</strong> 18 May 2026 &mdash; v2026.05.18.09 (09:08)<br />Lightweight portable RTF editor for Windows. Drop the exe anywhere and run.</p>
+<p style="text-align: center; font-size: 14px; color: #666; margin-bottom: 30px;"><strong>Latest Update:</strong> 18 May 2026 &mdash; v2026.05.18.12 (12:19)<br />Lightweight portable RTF editor for Windows. Drop the exe anywhere and run.</p>
+
+<h3 style="text-align: center;"><span style="color: #ff0000;">NSBEdit Version 2026.05.18.12</span></h3>
+<p><strong>Scintilla wrap indicator, [+] button fix, Edition 1 in About (18.05.2026, 12:19):</strong></p>
+<ul>
+<li><strong>Scintilla word wrap &#8629; indicator:</strong> A teal-green &#8629; glyph now appears at the right edge of every wrapped visual sub-line in Scintilla (code) tabs when word wrap is enabled. The indicator is drawn via <code>SCN_PAINTED</code> &mdash; Scintilla&rsquo;s documented post-paint notification &mdash; rather than a <code>WM_PAINT</code> subclass; Scintilla&rsquo;s own caret-blink and selection repaints were continuously overwriting any overlay placed from a subclass proc. The glyph is positioned to the left of the custom MSB vertical scrollbar: because the Scintilla window is created with <code>WS_CLIPSIBLINGS</code>, <code>GetDC</code> drawing in the scrollbar&rsquo;s area is silently clipped, making the previous attempt invisible. <code>msb_get_bar_hwnd</code> is used to query the scrollbar&rsquo;s left edge and set the right boundary accordingly. New helper: <code>Ne_DrawSciWrapIndicators(hSci)</code> called from <code>WM_NOTIFY &rarr; SCN_PAINTED</code>.</li>
+<li><strong>[+] new-tab button always visible:</strong> <code>NeTabs_TabProc</code> <code>WM_PAINT</code> now calls <code>RedrawWindow(hBtnNew, RDW_INVALIDATE | RDW_UPDATENOW)</code> after drawing the tab strip and the &times; close glyphs, so the [+] button is never left visually erased when Windows theming draws over the sibling button area during hover effects or tab switches.</li>
+<li><strong>Edition 1 in About dialog:</strong> The About dialog now shows <code>Edition: 1</code> below the version line. Locale key <code>ABOUT_EDITION</code> added to <code>locale/en_GB.txt</code>. The value will remain at&nbsp;1 until Edition&nbsp;2 is published.</li>
+</ul>
 
 <h3 style="text-align: center;"><span style="color: #ff0000;">NSBEdit Version 2026.05.18.09</span></h3>
 <p><strong>Paragraph Spacing dialog restyled and fixed (18.05.2026, 09:08):</strong></p>
