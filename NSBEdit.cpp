@@ -7243,13 +7243,10 @@ static void Ne_FtpTreeReloadItem(HWND hwnd, NeFtpBrowserData* d, HTREEITEM hItem
         TreeView_DeleteItem(d->hwndTree, hChild);
         hChild = hNext;
     }
-    TVINSERTSTRUCTW dummy = {};
-    dummy.hParent      = hItem;
-    dummy.hInsertAfter = TVI_LAST;
-    dummy.item.mask    = TVIF_TEXT | TVIF_PARAM;
-    dummy.item.pszText = (LPWSTR)L"";
-    dummy.item.lParam  = (LPARAM)(INT_PTR)-1;
-    TreeView_InsertItem(d->hwndTree, &dummy);
+    // Load children directly — do NOT rely on TreeView_Expand firing
+    // TVN_ITEMEXPANDING, because Windows silently skips that notification when
+    // the item was already in the expanded state before the reload.
+    Ne_FtpTreeLoadChildren(hwnd, hItem, d, nodeIdx);
     TreeView_Expand(d->hwndTree, hItem, TVE_EXPAND);
 }
 

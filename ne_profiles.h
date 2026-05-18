@@ -18,8 +18,11 @@ struct NeProfile {
 };
 
 // Call NeProfiles_Init() after NeCrypto_Init().
-// DB is created at %APPDATA%\NSBEdit\nsbedit.db or .\nsbedit.db (portable).
+// DB lookup order: %APPDATA%\NSBEdit\nsbedit.db (installed, must exist)
+//                  .\nsbedit.db (portable stub from ZIP, must exist)
+//                  :memory:     (fallback — warns user, all data lost on exit)
 bool NeProfiles_Init();
+bool NeProfiles_IsMemory(); // true when running on an in-memory DB
 void NeProfiles_Close();
 
 bool NeProfiles_Add   (NeProfile& p);           // sets p.id on success

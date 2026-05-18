@@ -6,7 +6,8 @@
 #include <string>
 #include <vector>
 
-static sqlite3* s_db = nullptr;
+static sqlite3* s_db      = nullptr;
+static bool     s_isMemory = false;
 
 // ── String helpers ────────────────────────────────────────────────────────────
 static std::string Np_W2U(const std::wstring& w)
@@ -28,27 +29,42 @@ static std::wstring Np_U2W(const char* u)
 }
 
 // ── DB path ───────────────────────────────────────────────────────────────────
+// Returns the path to use, or L":memory:" if no writable location is found.
 static std::wstring Np_GetDbPath()
 {
-    // Portable: if local nsbedit.db already exists, use it.
+    // 1. Installed: %APPDATA%\NSBEdit\nsbedit.db must already exist.
+    wchar_t appdata[MAX_PATH] = {};
+    if (SUCCEEDED(SHGetFolderPathW(NULL, CSIDL_APPDATA, NULL, 0, appdata))) {
+        std::wstring adPath = std::wstring(appdata) + L"\\NSBEdit\\nsbedit.db";
+        if (GetFileAttributesW(adPath.c_str()) != INVALID_FILE_ATTRIBUTES)
+            return adPath;
+    }
+
+    // 2. Portable: nsbedit.db next to the exe (stub from ZIP).
     if (GetFileAttributesW(L"nsbedit.db") != INVALID_FILE_ATTRIBUTES)
         return L"nsbedit.db";
 
-    // Otherwise use %APPDATA%\NSBEdit\nsbedit.db.
-    wchar_t appdata[MAX_PATH] = {};
-    if (SUCCEEDED(SHGetFolderPathW(NULL, CSIDL_APPDATA, NULL, 0, appdata))) {
-        std::wstring dir = std::wstring(appdata) + L"\\NSBEdit";
-        CreateDirectoryW(dir.c_str(), NULL);
-        return dir + L"\\nsbedit.db";
-    }
-    return L"nsbedit.db";
+    // 3. Nothing found — caller will open :memory: and warn the user.
+    return L":memory:";
 }
 
 // ── Init / close ──────────────────────────────────────────────────────────────
 bool NeProfiles_Init()
 {
     if (s_db) return true;
-    std::string path = Np_W2U(Np_GetDbPath());
+    std::wstring wpath = Np_GetDbPath();
+    s_isMemory = (wpath == L":memory:");
+    if (s_isMemory) {
+        MessageBoxW(NULL,
+            L"NSBEdit could not find a database file.\n\n"
+            L"Neither %APPDATA%\\NSBEdit\\nsbedit.db (installed) nor\n"
+            L"nsbedit.db next to the executable (portable) was found.\n\n"
+            L"FTP profiles and settings will be stored in memory only\n"
+            L"and will be lost when the application closes.",
+            L"NSBEdit \u2014 No database found",
+            MB_OK | MB_ICONWARNING);
+    }
+    std::string path = Np_W2U(wpath);
     if (sqlite3_open(path.c_str(), &s_db) != SQLITE_OK) {
         s_db = nullptr;
         return false;
@@ -81,9 +97,11 @@ bool NeProfiles_Init()
     return true;
 }
 
+bool NeProfiles_IsMemory() { return s_isMemory; }
+
 void NeProfiles_Close()
 {
-    if (s_db) { sqlite3_close(s_db); s_db = nullptr; }
+    if (s_db) { sqlite3_close(s_db); s_db = nullptr; s_isMemory = false; }
 }
 
 // ── Generic settings ─────────────────────────────────────────────────────
