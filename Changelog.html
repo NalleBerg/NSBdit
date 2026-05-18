@@ -1,6 +1,12 @@
 <h2 style="text-align: center; background-color: #e8f4f8; padding: 15px; border-radius: 5px; margin-bottom: 20px;"><span style="color: #0066cc;">&#x1F4DD; NSBEdit &mdash; Standalone RTF Notepad</span></h2>
 <h3 style="text-align: center;">&nbsp;</h3>
-<p style="text-align: center; font-size: 14px; color: #666; margin-bottom: 30px;"><strong>Latest Update:</strong> 17 May 2026 &mdash; v2026.05.17.15 (15:07)<br />Lightweight portable RTF editor for Windows. Drop the exe anywhere and run.</p>
+<p style="text-align: center; font-size: 14px; color: #666; margin-bottom: 30px;"><strong>Latest Update:</strong> 18 May 2026 &mdash; v2026.05.18.09 (09:08)<br />Lightweight portable RTF editor for Windows. Drop the exe anywhere and run.</p>
+
+<h3 style="text-align: center;"><span style="color: #ff0000;">NSBEdit Version 2026.05.18.09</span></h3>
+<p><strong>Paragraph Spacing dialog restyled and fixed (18.05.2026, 09:08):</strong></p>
+<ul>
+<li><strong>Paragraph Spacing dialog restyled and fixed:</strong> The Paragraph Spacing dialog (Format &rarr; Paragraph Spacing) now uses the app-standard owner-draw button system (<code>NeBtnTone</code> / <code>NeDialogButtonSpec</code> / <code>Ne_DrawDialogButton</code> / <code>Ne_BtnHoverProc</code>) with a white background, a blue Save button and a red Cancel button, and hover highlight on both. Root cause of Save/Cancel doing nothing fixed: the dialog class previously used <code>DefWindowProcW</code> as its <code>WndProc</code>, which silently discarded the <code>WM_COMMAND</code> notification sent <em>synchronously</em> by button clicks &mdash; the <code>GetMessageW</code> loop never saw it. The dialog now has a dedicated <code>Ne_ParSpaceDlgProc</code> that reads the spin-box values on <code>IDOK</code>, stores them in module-level statics (<code>s_parSpBefPt</code> / <code>s_parSpAftPt</code>), and calls <code>DestroyWindow</code>; the message loop exits when <code>IsWindow(dlg)</code> returns false, and the values are applied immediately after. All strings go through <code>Ls()</code> (i18n-correct: <code>DLG_PARSPACE</code>, <code>DLG_PARSPACE_BEF</code>, <code>DLG_PARSPACE_AFT</code>, <code>BTN_SAVE</code>, <code>BTN_CANCEL</code>).</li>
+</ul>
 
 <h3 style="text-align: center;"><span style="color: #ff0000;">NSBEdit Version 2026.05.17.15</span></h3>
 <p><strong>Horizontal Rule, status bar &ldquo;Rich text&rdquo; (17.05.2026, 15:07):</strong></p>

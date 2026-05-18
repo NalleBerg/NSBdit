@@ -1,6 +1,6 @@
 # NSBEdit
 
-A lightweight, standalone RTF notepad for Windows. **v2026.05.17.15**
+A lightweight, standalone RTF notepad for Windows. **v2026.05.18.09**
 
 ## Download
 
@@ -45,6 +45,7 @@ Just grab **[NSBEdit.exe](NSBEdit.exe)** — no installer, no extra files, no de
 - **Horizontal Rule** — insert a styled divider line (single, thick, double, dotted, dashed, or hairline) via the toolbar. Colour, width %, and indent are configurable. Behaves like a character: Delete or Backspace from the adjacent line removes it; Enter above moves it down; Ctrl+Z restores it
 - **RTF formatting toolbar shown on startup** — the app opens with the Rich Text toolbar active without needing to open a file first
 - **File → Open reuses blank tab** — opening a file when the only open tab is a fresh untitled one loads into that tab rather than creating an extra blank alongside it
+- **Paragraph Spacing dialog** — set space before/after a paragraph in points (Format → Paragraph Spacing); owner-draw blue/red buttons, white background, fully i18n
 
 ## Building from source
 

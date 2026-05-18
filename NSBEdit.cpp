@@ -4328,18 +4328,67 @@ static void Ne_ShowLineSpaceDialog(HWND parent, HWND hEdit)
 }
 
 // ── Paragraph Spacing dialog ──────────────────────────────────────────────────
+static NeDialogData s_parSpDD;
+static int          s_parSpBefPt;
+static int          s_parSpAftPt;
+
+static LRESULT CALLBACK Ne_ParSpaceDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+    switch (msg) {
+    case WM_COMMAND:
+        if (HIWORD(wParam) == BN_CLICKED) {
+            int cmd = LOWORD(wParam);
+            if (cmd == IDOK) {
+                wchar_t buf[8] = {};
+                GetWindowTextW(GetDlgItem(hwnd, IDC_NE_DLG_PAR_BEF), buf, 8);
+                s_parSpBefPt = _wtoi(buf);
+                GetWindowTextW(GetDlgItem(hwnd, IDC_NE_DLG_PAR_AFT), buf, 8);
+                s_parSpAftPt = _wtoi(buf);
+                s_parSpDD.result = IDOK;
+                DestroyWindow(hwnd);
+                return 0;
+            }
+            if (cmd == IDCANCEL) {
+                s_parSpDD.result = IDCANCEL;
+                DestroyWindow(hwnd);
+                return 0;
+            }
+        }
+        break;
+    case WM_DRAWITEM:
+        if (((const DRAWITEMSTRUCT*)lParam)->CtlType == ODT_BUTTON) {
+            Ne_DrawDialogButton((const DRAWITEMSTRUCT*)lParam, &s_parSpDD);
+            return TRUE;
+        }
+        break;
+    case WM_CTLCOLORSTATIC:
+        SetBkColor((HDC)wParam, GetSysColor(COLOR_WINDOW));
+        SetTextColor((HDC)wParam, RGB(20, 20, 20));
+        return (LRESULT)GetSysColorBrush(COLOR_WINDOW);
+    }
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
 static void Ne_ShowParSpaceDialog(HWND parent, HWND hEdit)
 {
     HINSTANCE hi = GetModuleHandleW(NULL);
+    static bool registered = false;
+    if (!registered) {
+        WNDCLASSW wc = {};
+        wc.lpfnWndProc   = Ne_ParSpaceDlgProc;
+        wc.hInstance     = hi;
+        wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+        wc.lpszClassName = L"NsbParSpClass";
+        RegisterClassW(&wc);
+        registered = true;
+    }
 
-    WNDCLASSW wc = {};
-    wc.lpfnWndProc   = DefWindowProcW;
-    wc.hInstance     = hi;
-    wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
-    wc.lpszClassName = L"NsbParSpClass";
-    if (!GetClassInfoW(hi, wc.lpszClassName, &wc)) RegisterClassW(&wc);
-
-    const int W = S(300), H = S(155);
+    const int P = S(10), EB = S(22), LH = S(24), CB = S(34);
+    int clientH = P + (EB + P) + (EB + P*2) + CB + P;
+    int clientW = S(300);
+    RECT wr = { 0, 0, clientW, clientH };
+    AdjustWindowRectEx(&wr, WS_POPUP|WS_CAPTION|WS_SYSMENU, FALSE, WS_EX_DLGMODALFRAME|WS_EX_WINDOWEDGE);
+    int W = wr.right - wr.left, H = wr.bottom - wr.top;
     RECT pr = {}; if (parent) GetWindowRect(parent, &pr);
     int x = (pr.left+pr.right)/2-W/2, y = (pr.top+pr.bottom)/2-H/2;
     if (y < 30) y = 30;
@@ -4352,7 +4401,6 @@ static void Ne_ShowParSpaceDialog(HWND parent, HWND hEdit)
 
     HFONT hf = Ne_MakeDlgFont(dlg);
     RECT rc; GetClientRect(dlg, &rc);
-    const int P = S(10), EB = S(22), LH = S(24), CB = S(26);
     int y0 = P;
 
     // Read current values (in twips; 1pt = 20 twips).
@@ -4383,41 +4431,51 @@ static void Ne_ShowParSpaceDialog(HWND parent, HWND hEdit)
     mkLbl(Ls(L"DLG_PARSPACE_BEF"), P, y0);
     HWND hBef = mkSpinP(IDC_NE_DLG_PAR_BEF, P+S(140), y0, befPt); y0 += EB + P;
     mkLbl(Ls(L"DLG_PARSPACE_AFT"), P, y0);
-    HWND hAft = mkSpinP(IDC_NE_DLG_PAR_AFT, P+S(140), y0, aftPt); y0 += EB + P*2;
+    mkSpinP(IDC_NE_DLG_PAR_AFT, P+S(140), y0, aftPt); y0 += EB + P*2;
 
-    int bw = S(80);
-    int bx = rc.right - P - bw;
-    auto mkBtnP = [&](int id, const wchar_t* t, int xx, bool def_) {
-        DWORD sty = WS_CHILD|WS_VISIBLE|(def_?BS_DEFPUSHBUTTON:BS_PUSHBUTTON);
-        HWND h = CreateWindowExW(0,L"BUTTON",t,sty, xx,y0,bw,CB, dlg,(HMENU)(UINT_PTR)id,hi,NULL);
-        if(hf) SendMessageW(h,WM_SETFONT,(WPARAM)hf,TRUE);
-    };
-    mkBtnP(IDCANCEL, Ls(L"BTN_CANCEL"), bx, false); bx -= bw + S(6);
-    mkBtnP(IDOK,     Ls(L"BTN_SAVE"),   bx, true);
+    // Owner-draw Save / Cancel buttons
+    s_parSpDD = {};
+    s_parSpDD.buttonCount = 2;
+    s_parSpDD.buttons[0] = { IDOK,     Ls(L"BTN_SAVE"),   NeBtnTone::Blue, IDI_INFORMATION, Ne_MeasureButtonWidth(Ls(L"BTN_SAVE"))   };
+    s_parSpDD.buttons[1] = { IDCANCEL, Ls(L"BTN_CANCEL"), NeBtnTone::Red,  IDI_ERROR,       Ne_MeasureButtonWidth(Ls(L"BTN_CANCEL")) };
+    {
+        int totalBtnW = 0;
+        for (int i = 0; i < s_parSpDD.buttonCount; i++) {
+            totalBtnW += s_parSpDD.buttons[i].width;
+            if (i + 1 < s_parSpDD.buttonCount) totalBtnW += S(6);
+        }
+        int bx = (rc.right - totalBtnW) / 2;
+        for (int i = 0; i < s_parSpDD.buttonCount; i++) {
+            auto& b = s_parSpDD.buttons[i];
+            DWORD sty = WS_CHILD | WS_VISIBLE | BS_OWNERDRAW;
+            if (b.id == IDOK) sty |= BS_DEFPUSHBUTTON;
+            HWND hBtn = CreateWindowExW(0, L"BUTTON", b.text.c_str(), sty,
+                bx, y0, b.width, CB, dlg, (HMENU)(UINT_PTR)b.id, hi, NULL);
+            if (hBtn) {
+                WNDPROC prev = (WNDPROC)SetWindowLongPtrW(hBtn, GWLP_WNDPROC, (LONG_PTR)Ne_BtnHoverProc);
+                SetPropW(hBtn, L"NePrevProc", (HANDLE)prev);
+            }
+            bx += b.width + S(6);
+        }
+    }
 
     if (parent) EnableWindow(parent, FALSE);
     SetFocus(hBef);
 
-    MSG m; bool ok = false;
+    MSG m;
+    s_parSpDD.result = IDCANCEL;
     while (IsWindow(dlg) && GetMessageW(&m, NULL, 0, 0)) {
         if (m.message == WM_KEYDOWN && m.wParam == VK_ESCAPE) { DestroyWindow(dlg); break; }
         if (!IsDialogMessageW(dlg, &m)) { TranslateMessage(&m); DispatchMessageW(&m); }
-        if (!IsWindow(dlg)) break;
-        if (m.message == WM_COMMAND && LOWORD(m.wParam) == IDOK && m.hwnd == dlg) { ok = true; break; }
     }
     if (parent) { EnableWindow(parent, TRUE); SetForegroundWindow(parent); }
 
-    if (ok && IsWindow(dlg)) {
-        wchar_t bb[8]={}, ab[8]={};
-        GetWindowTextW(hBef, bb, 8); GetWindowTextW(hAft, ab, 8);
-        DestroyWindow(dlg);
+    if (s_parSpDD.result == IDOK) {
         PARAFORMAT2 pf2 = {}; pf2.cbSize = sizeof(pf2);
         pf2.dwMask        = PFM_SPACEBEFORE | PFM_SPACEAFTER;
-        pf2.dySpaceBefore = (LONG)(_wtoi(bb) * 20);
-        pf2.dySpaceAfter  = (LONG)(_wtoi(ab) * 20);
+        pf2.dySpaceBefore = (LONG)(s_parSpBefPt * 20);
+        pf2.dySpaceAfter  = (LONG)(s_parSpAftPt  * 20);
         SendMessageW(hEdit, EM_SETPARAFORMAT, 0, (LPARAM)&pf2);
-    } else if (IsWindow(dlg)) {
-        DestroyWindow(dlg);
     }
     SetFocus(hEdit);
 }
